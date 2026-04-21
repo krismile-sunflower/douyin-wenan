@@ -73,10 +73,10 @@ async function main() {
     log(colors.gray, `  输入: ${inputPath}`);
 
     try {
-      const result = await remover.removeByAutoCrop(inputPath, outputFileName);
+      const result = await remover.removeByInpaint(inputPath, outputFileName);
 
       log(colors.green, `  成功: ${outputFileName}`);
-      log(colors.gray, `  检测到水印高度: ${result.detectedHeight}px`);
+      log(colors.gray, `  修复像素: ${result.repairedPixels}`);
       log(colors.gray, `  原大小: ${(result.originalSize / 1024).toFixed(1)} KB`);
       log(colors.gray, `  处理后: ${(result.outputSize / 1024).toFixed(1)} KB`);
       log(colors.gray, `  路径: ${result.outputPath}`);

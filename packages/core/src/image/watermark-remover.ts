@@ -26,7 +26,7 @@ export interface ApiConfig {
 
 export interface WatermarkRemoveResult {
   outputPath: string;
-  method: 'crop' | 'api';
+  method: 'crop' | 'api' | 'inpaint';
   originalSize: number;
   outputSize: number;
 }
@@ -376,6 +376,125 @@ export class WatermarkRemover {
         originalSize: originalStats.size,
         outputSize: outputStats.size,
         detectedHeight: watermarkHeight,
+      };
+    } catch (error) {
+      if (isTempInput) {
+        await fs.promises.unlink(inputPath).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 通过像素修复去除水印（不裁剪，保留图片完整尺寸）
+   * 检测水印区域后，用上方像素进行垂直修复 + 渐变混合
+   */
+  async removeByInpaint(
+    imageUrlOrPath: string,
+    outputFileName?: string
+  ): Promise<WatermarkRemoveResult & { repairedPixels: number }> {
+    let sharpInstance: ((input?: string | Buffer) => import('sharp').Sharp) | undefined;
+    try {
+      const sharpModule = await import('sharp');
+      sharpInstance = (sharpModule as unknown as { default: (input?: string | Buffer) => import('sharp').Sharp }).default;
+    } catch {
+      throw new Error('像素修复去水印需要安装 sharp 依赖，请运行: pnpm add sharp');
+    }
+
+    const inputPath = await this.resolveInputPath(imageUrlOrPath);
+    const isTempInput = imageUrlOrPath.startsWith('http://') || imageUrlOrPath.startsWith('https://');
+
+    try {
+      const image = sharpInstance(inputPath);
+      const metadata = await image.metadata();
+
+      const width = metadata.width || 0;
+      const height = metadata.height || 0;
+
+      if (width === 0 || height === 0) {
+        throw new Error('无法读取图片尺寸');
+      }
+
+      const watermarkHeight = await this.detectWatermarkHeight(inputPath);
+
+      if (watermarkHeight === 0) {
+        throw new Error('未检测到水印区域，图片可能没有明显水印');
+      }
+
+      const { data, info } = await image
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      const channels = info.channels;
+      const bytesPerRow = width * channels;
+
+      // 参考行：水印区域上方 5 行的像素平均值
+      const refRowStart = Math.max(0, height - watermarkHeight - 5);
+      const refRowEnd = height - watermarkHeight;
+      const refPixels = new Float32Array(bytesPerRow);
+      const refRowCount = refRowEnd - refRowStart;
+
+      for (let row = refRowStart; row < refRowEnd; row++) {
+        const rowStart = row * bytesPerRow;
+        for (let x = 0; x < bytesPerRow; x++) {
+          refPixels[x] += data[rowStart + x];
+        }
+      }
+      for (let x = 0; x < bytesPerRow; x++) {
+        refPixels[x] /= refRowCount;
+      }
+
+      // 修复水印区域：垂直方向用参考行像素替换，顶部做渐变混合
+      const wmStartRow = height - watermarkHeight;
+      const blendZone = Math.min(Math.floor(watermarkHeight * 0.3), 20);
+      let repairedPixels = 0;
+
+      for (let row = wmStartRow; row < height; row++) {
+        const rowStart = row * bytesPerRow;
+        const distFromTop = row - wmStartRow;
+        // 渐变混合：靠近水印顶部的行混合更多参考像素
+        const blend = blendZone > 0 && distFromTop < blendZone
+          ? distFromTop / blendZone
+          : 1.0;
+
+        for (let x = 0; x < bytesPerRow; x++) {
+          const orig = data[rowStart + x];
+          const repair = Math.round(refPixels[x]);
+
+          if (blend >= 1.0) {
+            data[rowStart + x] = repair;
+          } else {
+            data[rowStart + x] = Math.round(orig * (1 - blend) + repair * blend);
+          }
+          repairedPixels++;
+        }
+      }
+
+      repairedPixels = Math.floor(repairedPixels / channels);
+
+      const outputName = outputFileName || `wm_inpaint_${Date.now()}.jpg`;
+      const outputPath = path.join(this.tempDir, outputName);
+
+      const sharpMod = (await import('sharp')).default || (await import('sharp'));
+      await sharpMod(Buffer.from(data), {
+        raw: { width, height, channels: channels as 1 | 2 | 3 | 4 },
+      })
+        .jpeg({ quality: 95 })
+        .toFile(outputPath);
+
+      const originalStats = fs.statSync(inputPath);
+      const outputStats = fs.statSync(outputPath);
+
+      if (isTempInput) {
+        await fs.promises.unlink(inputPath).catch(() => {});
+      }
+
+      return {
+        outputPath,
+        method: 'inpaint',
+        originalSize: originalStats.size,
+        outputSize: outputStats.size,
+        repairedPixels,
       };
     } catch (error) {
       if (isTempInput) {
