@@ -387,7 +387,7 @@ export class WatermarkRemover {
 
   /**
    * 通过像素修复去除水印（不裁剪，保留图片完整尺寸）
-   * 检测水印区域后，用上方像素进行垂直修复 + 渐变混合
+   * 升级版算法: 多方向纹理传播 + Patch匹配填充 + 边缘感知 + 后处理平滑
    */
   async removeByInpaint(
     imageUrlOrPath: string,
@@ -427,50 +427,9 @@ export class WatermarkRemover {
 
       const channels = info.channels;
       const bytesPerRow = width * channels;
-
-      // 参考行：水印区域上方 5 行的像素平均值
-      const refRowStart = Math.max(0, height - watermarkHeight - 5);
-      const refRowEnd = height - watermarkHeight;
-      const refPixels = new Float32Array(bytesPerRow);
-      const refRowCount = refRowEnd - refRowStart;
-
-      for (let row = refRowStart; row < refRowEnd; row++) {
-        const rowStart = row * bytesPerRow;
-        for (let x = 0; x < bytesPerRow; x++) {
-          refPixels[x] += data[rowStart + x];
-        }
-      }
-      for (let x = 0; x < bytesPerRow; x++) {
-        refPixels[x] /= refRowCount;
-      }
-
-      // 修复水印区域：垂直方向用参考行像素替换，顶部做渐变混合
       const wmStartRow = height - watermarkHeight;
-      const blendZone = Math.min(Math.floor(watermarkHeight * 0.3), 20);
-      let repairedPixels = 0;
 
-      for (let row = wmStartRow; row < height; row++) {
-        const rowStart = row * bytesPerRow;
-        const distFromTop = row - wmStartRow;
-        // 渐变混合：靠近水印顶部的行混合更多参考像素
-        const blend = blendZone > 0 && distFromTop < blendZone
-          ? distFromTop / blendZone
-          : 1.0;
-
-        for (let x = 0; x < bytesPerRow; x++) {
-          const orig = data[rowStart + x];
-          const repair = Math.round(refPixels[x]);
-
-          if (blend >= 1.0) {
-            data[rowStart + x] = repair;
-          } else {
-            data[rowStart + x] = Math.round(orig * (1 - blend) + repair * blend);
-          }
-          repairedPixels++;
-        }
-      }
-
-      repairedPixels = Math.floor(repairedPixels / channels);
+      this.advancedInpaint(data, width, height, channels, bytesPerRow, wmStartRow);
 
       const outputName = outputFileName || `wm_inpaint_${Date.now()}.jpg`;
       const outputPath = path.join(this.tempDir, outputName);
@@ -494,13 +453,260 @@ export class WatermarkRemover {
         method: 'inpaint',
         originalSize: originalStats.size,
         outputSize: outputStats.size,
-        repairedPixels,
+        repairedPixels: width * watermarkHeight,
       };
     } catch (error) {
       if (isTempInput) {
         await fs.promises.unlink(inputPath).catch(() => {});
       }
       throw error;
+    }
+  }
+
+  /**
+   * 高级 inpaint 算法核心实现
+   * 分4个阶段: Patch匹配填充 -> 多方向纹理传播 -> 边缘感知细化 -> 双边滤波平滑
+   */
+  private advancedInpaint(
+    data: Buffer,
+    width: number,
+    height: number,
+    channels: number,
+    bytesPerRow: number,
+    wmStartRow: number
+  ): void {
+    const wmHeight = height - wmStartRow;
+    const patchSize = 8;
+    const halfPatch = patchSize >> 1;
+
+    const px = (row: number, col: number, c: number) => (row * bytesPerRow + col * channels + c);
+
+    const getPixel = (row: number, col: number, c: number): number => {
+      if (row < 0 || row >= height || col < 0 || col >= width) return 128;
+      return data[px(row, col, c)];
+    };
+
+    const clamp = (v: number) => Math.max(0, Math.min(255, v));
+
+    const patchSSD = (r1: number, c1: number, r2: number, c2: number): number => {
+      let sum = 0;
+      for (let dr = -halfPatch; dr <= halfPatch; dr++) {
+        for (let dc = -halfPatch; dc <= halfPatch; dc++) {
+          for (let ch = 0; ch < 3; ch++) {
+            const diff = getPixel(r1 + dr, c1 + dc, ch) - getPixel(r2 + dr, c2 + dc, ch);
+            sum += diff * diff;
+          }
+        }
+      }
+      return sum;
+    };
+
+    // Phase 1: Patch 匹配填充 — 对水印区域的每个 patch，在上方搜索最相似的非水印 patch
+    const filled = new Float32Array(wmHeight * width * channels);
+    const searchRegionH = Math.min(wmStartRow, 120);
+
+    for (let row = wmStartRow; row < height; row += patchSize) {
+      for (let col = 0; col < width; col += patchSize) {
+        const centerR = Math.min(row + halfPatch, height - 1);
+        const centerC = Math.min(col + halfPatch, width - 1);
+
+        let bestSSD = Infinity;
+        let bestSR = wmStartRow - halfPatch;
+        let bestSC = centerC;
+
+        const searchStart = Math.max(halfPatch, wmStartRow - searchRegionH);
+        const step = Math.max(1, Math.floor((wmStartRow - searchStart) / 40));
+
+        for (let sr = wmStartRow - 1; sr >= searchStart; sr -= step) {
+          const ssd = patchSSD(centerR, centerC, sr, centerC);
+          if (ssd < bestSSD) {
+            bestSSD = ssd;
+            bestSR = sr;
+          }
+        }
+
+        const localSearchR = Math.max(halfPatch, bestSR - patchSize * 2);
+        const localSearchREnd = Math.min(wmStartRow - halfPatch, bestSR + patchSize * 2);
+        for (let sr = localSearchR; sr <= localSearchREnd; sr++) {
+          for (let sc = Math.max(halfPatch, centerC - patchSize * 2); sc <= Math.min(width - halfPatch - 1, centerC + patchSize * 2); sc++) {
+            const ssd = patchSSD(centerR, centerC, sr, sc);
+            if (ssd < bestSSD) {
+              bestSSD = ssd;
+              bestSR = sr;
+              bestSC = sc;
+            }
+          }
+        }
+
+        for (let dr = -halfPatch; dr <= halfPatch; dr++) {
+          for (let dc = -halfPatch; dc <= halfPatch; dc++) {
+            const tr = row + dr;
+            const tc = col + dc;
+            if (tr >= wmStartRow && tr < height && tc >= 0 && tc < width) {
+              const fi = (tr - wmStartRow) * width * channels + tc * channels;
+              for (let ch = 0; ch < channels; ch++) {
+                filled[fi + ch] = getPixel(bestSR + dr, bestSC + dc, ch);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    for (let r = wmStartRow; r < height; r++) {
+      for (let c = 0; c < width; c++) {
+        const fi = (r - wmStartRow) * width * channels + c * channels;
+        let hasFilled = false;
+        for (let ch = 0; ch < channels; ch++) {
+          if (filled[fi + ch] > 0) { hasFilled = true; break; }
+        }
+        if (!hasFilled) {
+          const refR = Math.max(0, r - 1);
+          for (let ch = 0; ch < channels; ch++) {
+            filled[fi + ch] = data[px(refR, c, ch)];
+          }
+        }
+      }
+    }
+
+    // Phase 2: 多方向纹理传播 — 从上/左/右边界向中心加权融合
+    const propagated = new Float32Array(wmHeight * width * channels);
+    const maxDist = wmHeight + width * 0.5;
+
+    for (let r = wmStartRow; r < height; r++) {
+      for (let c = 0; c < width; c++) {
+        const pi = (r - wmStartRow) * width * channels + c * channels;
+        let wSum = 0;
+        const val = [0, 0, 0, 0];
+
+        const fromTop = () => {
+          const dist = (r - wmStartRow + 1);
+          const w = 1 / (dist * dist + 1);
+          const srcR = Math.max(0, wmStartRow - 1);
+          return { w, srcR, srcC: c };
+        };
+        const fromLeft = () => {
+          const margin = Math.min(c, Math.floor(width * 0.15));
+          if (margin < 3) return null;
+          const dist = margin;
+          const w = 0.5 / (dist * dist + 1);
+          return { w, srcR: r, srcC: Math.max(0, c - margin - 1) };
+        };
+        const fromRight = () => {
+          const margin = Math.min(width - 1 - c, Math.floor(width * 0.15));
+          if (margin < 3) return null;
+          const dist = margin;
+          const w = 0.5 / (dist * dist + 1);
+          return { w, srcR: r, srcC: Math.min(width - 1, c + margin + 1) };
+        };
+
+        const sources = [fromTop(), fromLeft(), fromRight()].filter(Boolean) as { w: number; srcR: number; srcC: number }[];
+
+        for (const s of sources) {
+          for (let ch = 0; ch < channels; ch++) {
+            val[ch] += data[px(s.srcR, s.srcC, ch)] * s.w;
+          }
+          wSum += s.w;
+        }
+
+        const patchVal = [filled[pi], filled[pi + 1], filled[pi + 2], channels > 3 ? filled[pi + 3] : 0];
+        const patchW = 1.5;
+
+        for (let ch = 0; ch < channels; ch++) {
+          val[ch] += patchVal[ch] * patchW;
+        }
+        wSum += patchW;
+
+        for (let ch = 0; ch < channels; ch++) {
+          propagated[pi + ch] = val[ch] / wSum;
+        }
+      }
+    }
+
+    // Phase 3: 边缘感知细化 — 检测水平边缘并沿边缘方向优先填充
+    const edgeRadius = 2;
+    for (let r = wmStartRow; r < height; r++) {
+      for (let c = edgeRadius; c < width - edgeRadius; c++) {
+        const pi = (r - wmStartRow) * width * channels + c * channels;
+
+        let leftGrad = 0, rightGrad = 0;
+        for (let ch = 0; ch < 3; ch++) {
+          leftGrad += Math.abs(propagated[pi + ch] - propagated[(c - edgeRadius) * channels + ch]);
+          rightGrad += Math.abs(propagated[pi + ch] - propagated[(c + edgeRadius) * channels + ch]);
+        }
+
+        if (leftGrad + rightGrad > 30) {
+          const edgeW = 0.3;
+          const neighborAvg = (cSide: number) => {
+            let sum = [0, 0, 0, 0];
+            for (let dc = -1; dc <= 1; dc++) {
+              const ni = (r - wmStartRow) * width * channels + (c + cSide + dc) * channels;
+              for (let ch = 0; ch < channels; ch++) {
+                sum[ch] += propagated[ni + ch];
+              }
+            }
+            return sum.map(v => v / 3);
+          };
+
+          const lAvg = leftGrad > rightGrad ? neighborAvg(-1) : neighborAvg(1);
+          for (let ch = 0; ch < channels; ch++) {
+            propagated[pi + ch] = propagated[pi + ch] * (1 - edgeW) + lAvg[ch] * edgeW;
+          }
+        }
+      }
+    }
+
+    // Phase 4: 双边滤波后处理 — 平滑噪声同时保持边缘
+    const spatialSigma = 2.0;
+    const rangeSigma = 25.0;
+    const radius = 2;
+    const output = new Uint8Array(wmHeight * width * channels);
+
+    for (let r = wmStartRow; r < height; r++) {
+      for (let c = 0; c < width; c++) {
+        const pi = (r - wmStartRow) * width * channels + c * channels;
+        let wSum = 0;
+        const val = [0.0, 0.0, 0.0, 0.0];
+        const center = [propagated[pi], propagated[pi + 1], propagated[pi + 2], channels > 3 ? propagated[pi + 3] : 0];
+
+        for (let dr = -radius; dr <= radius; dr++) {
+          for (let dc = -radius; dc <= radius; dc++) {
+            const nr = r + dr, nc = c + dc;
+            if (nr < wmStartRow || nr >= height || nc < 0 || nc >= width) continue;
+
+            const ni = (nr - wmStartRow) * width * channels + nc * channels;
+            const neighbor = [propagated[ni], propagated[ni + 1], propagated[ni + 2], channels > 3 ? propagated[ni + 3] : 0];
+
+            const spatialDist = Math.sqrt(dr * dr + dc * dc);
+            const spatialW = Math.exp(-(spatialDist * spatialDist) / (2 * spatialSigma * spatialSigma));
+
+            let rangeDist = 0;
+            for (let ch = 0; ch < 3; ch++) {
+              rangeDist += (center[ch] - neighbor[ch]) ** 2;
+            }
+            const rangeW = Math.exp(-rangeDist / (2 * rangeSigma * rangeSigma));
+
+            const w = spatialW * rangeW;
+            for (let ch = 0; ch < channels; ch++) {
+              val[ch] += neighbor[ch] * w;
+            }
+            wSum += w;
+          }
+        }
+
+        for (let ch = 0; ch < channels; ch++) {
+          output[pi + ch] = clamp(Math.round(val[ch] / Math.max(wSum, 0.001)));
+        }
+      }
+    }
+
+    // 写回原始数据
+    for (let r = wmStartRow; r < height; r++) {
+      const rowStart = r * bytesPerRow;
+      const oi = (r - wmStartRow) * width * channels;
+      for (let x = 0; x < width * channels; x++) {
+        data[rowStart + x] = output[oi + x];
+      }
     }
   }
 
