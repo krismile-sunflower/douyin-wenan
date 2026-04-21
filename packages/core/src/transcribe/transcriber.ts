@@ -1,13 +1,12 @@
 /**
  * 阿里云百炼语音识别模块
  * 使用 DashScope paraformer-v2 模型进行视频文案提取
- * 
+ *
  * 参考: https://github.com/yzfly/douyin-mcp-server
  * 直接用视频 URL 调用百炼 API，不需要下载视频到本地
  */
 
 import axios from 'axios';
-import * as https from 'https';
 
 export interface TranscriptionResult {
   taskId: string;

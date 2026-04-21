@@ -1,0 +1,24 @@
+{
+  "name": "@douyin-wenan/api",
+  "version": "1.0.0",
+  "description": "抖音文案提取 API 服务",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@douyin-wenan/core": "workspace:*",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.19.17",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,9 +1,6 @@
 /**
- * 视频下载模块
- * 获取无水印视频 URL 并下载
- * 
- * 参考: https://github.com/yzfly/douyin-mcp-server
- * 从 _ROUTER_DATA 中提取视频信息，通过 iesdouyin.com 获取
+ * 图片服务模块
+ * 支持抖音图集解析下载、图片去水印
  */
 
 import axios, { AxiosInstance } from 'axios';
@@ -12,24 +9,30 @@ import * as path from 'path';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 
-export interface VideoDownloadResult {
-  videoUrl: string;
+export interface AlbumImage {
+  url: string;
+  width: number;
+  height: number;
+}
+
+export interface AlbumInfo {
+  albumId: string;
+  title: string;
+  images: AlbumImage[];
+  imageCount: number;
+}
+
+export interface ImageDownloadResult {
+  imageUrl: string;
   filePath: string;
   fileSize: number;
-  title: string;
-  videoId: string;
+  width: number;
+  height: number;
 }
 
-export interface VideoInfo {
-  videoUrl: string;
-  title: string;
-  videoId: string;
-}
-
-// 移动端 UA (参考 douyin-mcp-server)
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1';
 
-export class VideoDownloader {
+export class ImageService {
   private client: AxiosInstance;
   private userAgent: string;
   private tempDir: string;
@@ -50,8 +53,6 @@ export class VideoDownloader {
 
   /**
    * 从分享文本中提取 URL
-   * 参考 douyin-mcp-server 的 parse_share_url 方法
-   * 示例输入: "3.33 复制打开抖音，看看【徐大队的作品】# 包子手法 https://v.douyin.com/efvO2fplgMc/ z@g.oD Jic:/ 12/30"
    */
   private extractUrlFromShareText(shareText: string): string {
     const urlPattern = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g;
@@ -65,15 +66,12 @@ export class VideoDownloader {
   }
 
   /**
-   * 获取抖音视频的无水印 URL 和基本信息
-   * 参考 douyin-mcp-server 的 parse_share_url 方法
+   * 获取抖音图集的无水印图片信息
    * 支持输入: 完整分享文本 或 纯 URL
    */
-  async getVideoInfo(shareText: string): Promise<VideoInfo> {
-    // 步骤 0: 从分享文本中提取 URL
+  async getAlbumInfo(shareText: string): Promise<AlbumInfo> {
     const shareUrl = this.extractUrlFromShareText(shareText);
 
-    // 步骤 1: 跟随短链重定向，提取 video_id
     const redirectResponse = await axios.get(shareUrl, {
       headers: { 'User-Agent': this.userAgent },
       maxRedirects: 10,
@@ -81,14 +79,13 @@ export class VideoDownloader {
     });
 
     const finalUrl = redirectResponse.request?.res?.responseUrl || shareUrl;
-    const videoId = finalUrl.split('?')[0].split('/').filter(Boolean).pop() || '';
+    const albumId = finalUrl.split('?')[0].split('/').filter(Boolean).pop() || '';
 
-    if (!videoId) {
-      throw new Error('无法从链接中提取视频 ID');
+    if (!albumId) {
+      throw new Error('无法从链接中提取图集 ID');
     }
 
-    // 步骤 2: 通过 iesdouyin.com 获取视频信息
-    const iesUrl = `https://www.iesdouyin.com/share/video/${videoId}`;
+    const iesUrl = `https://www.iesdouyin.com/share/video/${albumId}`;
 
     const response = await axios.get(iesUrl, {
       headers: {
@@ -100,24 +97,20 @@ export class VideoDownloader {
     });
 
     const html = response.data as string;
+    const albumInfo = this.extractAlbumInfoFromHtml(html, albumId);
 
-    // 步骤 3: 从 _ROUTER_DATA 中提取视频信息
-    const videoInfo = this.extractVideoInfoFromHtml(html, videoId);
-
-    if (!videoInfo) {
-      throw new Error('无法从页面中提取视频信息');
+    if (!albumInfo) {
+      throw new Error('无法从页面中提取图集信息');
     }
 
-    return videoInfo;
+    return albumInfo;
   }
 
   /**
-   * 从 HTML 中提取视频信息
-   * 参考 douyin-mcp-server 的 _ROUTER_DATA 解析逻辑
+   * 从 HTML 中提取图集信息
    */
-  private extractVideoInfoFromHtml(html: string, fallbackVideoId: string): VideoInfo | null {
+  private extractAlbumInfoFromHtml(html: string, fallbackAlbumId: string): AlbumInfo | null {
     try {
-      // 从 _ROUTER_DATA 中提取
       const routerDataMatch = html.match(/window\._ROUTER_DATA\s*=\s*(.*?)<\/script>/s);
       if (!routerDataMatch || !routerDataMatch[1]) {
         return null;
@@ -145,23 +138,51 @@ export class VideoDownloader {
       }
 
       const data = itemList[0] as Record<string, unknown>;
-      const video = data.video as Record<string, unknown>;
-      const playAddr = video?.play_addr as Record<string, unknown>;
-      const urlList = playAddr?.url_list as string[];
+      const images = data.images as Record<string, unknown>[];
 
-      if (!urlList || !urlList[0]) {
+      if (!images || images.length === 0) {
+        // 尝试解析视频封面作为单张图片
+        const video = data.video as Record<string, unknown>;
+        const cover = video?.cover as Record<string, unknown>;
+        const urlList = cover?.url_list as string[];
+
+        if (urlList && urlList[0]) {
+          const desc = ((data.desc as string) || '').trim() || `douyin_${fallbackAlbumId}`;
+          return {
+            albumId: fallbackAlbumId,
+            title: desc.replace(/[\\/:*?"<>|]/g, '_'),
+            images: [{
+              url: urlList[0],
+              width: (cover.width as number) || 0,
+              height: (cover.height as number) || 0,
+            }],
+            imageCount: 1,
+          };
+        }
         return null;
       }
 
-      // 去水印: 将 playwm 替换为 play
-      let videoUrl = urlList[0].replace('playwm', 'play');
+      const albumImages: AlbumImage[] = images.map((img) => {
+        const urlList = (img.url_list as string[]) || [];
+        // 去水印: 使用无水印链接
+        let url = urlList[0] || '';
+        if (url) {
+          url = url.replace(/~tplv-[^/]+/, '~tplv-ow360noawqhd');
+        }
+        return {
+          url,
+          width: (img.width as number) || 0,
+          height: (img.height as number) || 0,
+        };
+      }).filter((img) => img.url);
 
-      const desc = ((data.desc as string) || '').trim() || `douyin_${fallbackVideoId}`;
+      const desc = ((data.desc as string) || '').trim() || `douyin_${fallbackAlbumId}`;
 
       return {
-        videoUrl,
+        albumId: fallbackAlbumId,
         title: desc.replace(/[\\/:*?"<>|]/g, '_'),
-        videoId: fallbackVideoId,
+        images: albumImages,
+        imageCount: albumImages.length,
       };
     } catch {
       return null;
@@ -169,19 +190,11 @@ export class VideoDownloader {
   }
 
   /**
-   * 获取无水印视频 URL (仅 URL，不下载)
+   * 下载单张图片到本地
    */
-  async getVideoUrl(shareUrl: string): Promise<string> {
-    const info = await this.getVideoInfo(shareUrl);
-    return info.videoUrl;
-  }
-
-  /**
-   * 下载视频到本地
-   */
-  async download(videoUrl: string, fileName?: string): Promise<VideoDownloadResult> {
-    const url = videoUrl.replace(/^http:/, 'https:');
-    const safeFileName = fileName || `video_${Date.now()}.mp4`;
+  async downloadImage(imageUrl: string, fileName?: string): Promise<ImageDownloadResult> {
+    const url = imageUrl.replace(/^http:/, 'https:');
+    const safeFileName = fileName || `image_${Date.now()}.jpg`;
     const filePath = path.join(this.tempDir, safeFileName);
 
     try {
@@ -198,11 +211,11 @@ export class VideoDownloader {
       const stats = fs.statSync(filePath);
 
       return {
-        videoUrl: url,
+        imageUrl: url,
         filePath,
         fileSize: stats.size,
-        title: safeFileName,
-        videoId: '',
+        width: 0,
+        height: 0,
       };
     } catch (error) {
       try {
@@ -213,8 +226,27 @@ export class VideoDownloader {
         // 忽略清理错误
       }
 
-      throw new Error(`视频下载失败: ${error instanceof Error ? error.message : '未知错误'}`);
+      throw new Error(`图片下载失败: ${error instanceof Error ? error.message : '未知错误'}`);
     }
+  }
+
+  /**
+   * 批量下载图集图片
+   */
+  async downloadAlbum(albumInfo: AlbumInfo): Promise<ImageDownloadResult[]> {
+    const results: ImageDownloadResult[] = [];
+
+    for (let i = 0; i < albumInfo.images.length; i++) {
+      const image = albumInfo.images[i];
+      const ext = path.extname(new URL(image.url).pathname) || '.jpg';
+      const fileName = `${albumInfo.title}_${i + 1}${ext}`;
+      const result = await this.downloadImage(image.url, fileName);
+      result.width = image.width;
+      result.height = image.height;
+      results.push(result);
+    }
+
+    return results;
   }
 
   /**

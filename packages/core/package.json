@@ -1,0 +1,26 @@
+{
+  "name": "@douyin-wenan/core",
+  "version": "1.0.0",
+  "description": "抖音文案提取核心库",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@alicloud/pop-core": "^1.7.0",
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "sharp": "^0.34.5",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/fluent-ffmpeg": "^2.1.0",
+    "@types/node": "^22.19.17",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.6.0"
+  }
+}

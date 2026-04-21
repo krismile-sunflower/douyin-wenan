@@ -1,24 +1,14 @@
-/**
- * 视频路由 - 处理视频解析和下载相关请求
- */
-
 import { Router, Request, Response } from 'express';
-import { VideoDownloader } from '../../downloader';
-import { safeDelete, generateFileName, loadConfig } from '../../utils';
+import { VideoDownloader, safeDelete, generateFileName, loadConfig } from '@douyin-wenan/core';
 
-const router = Router();
+const router: Router = Router();
 
-// 初始化依赖
 const config = loadConfig();
 const downloader = new VideoDownloader({
   userAgent: config.douyin.userAgent,
   tempDir: config.tempDir,
 });
 
-/**
- * POST /api/parse
- * 解析抖音分享链接，返回视频信息
- */
 router.post('/parse', async (req: Request, res: Response, next) => {
   try {
     const { url } = req.body;
@@ -46,10 +36,6 @@ router.post('/parse', async (req: Request, res: Response, next) => {
   }
 });
 
-/**
- * POST /api/download
- * 下载无水印视频，返回文件路径和 URL
- */
 router.post('/download', async (req: Request, res: Response, next) => {
   try {
     const { url } = req.body;
@@ -62,10 +48,7 @@ router.post('/download', async (req: Request, res: Response, next) => {
       return;
     }
 
-    // 获取视频信息 (包含无水印 URL)
     const videoInfo = await downloader.getVideoInfo(url);
-
-    // 下载视频
     const fileName = generateFileName('video', 'mp4');
     const downloadResult = await downloader.download(videoInfo.videoUrl, fileName);
 
@@ -84,10 +67,6 @@ router.post('/download', async (req: Request, res: Response, next) => {
   }
 });
 
-/**
- * DELETE /api/download/:fileName
- * 清理已下载的视频文件
- */
 router.delete('/download/:fileName', async (req: Request, res: Response, next) => {
   try {
     const { fileName } = req.params;

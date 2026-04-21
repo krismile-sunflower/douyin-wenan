@@ -1,25 +1,42 @@
-# 抖音文案提取服务
+# 抖音工具服务
 
-从抖音分享链接提取视频文案的 Node.js 后端服务。
+从抖音分享链接提取视频文案、解析图集下载无水印图片的 Node.js 后端服务（monorepo 架构）。
 
-## 工作流程
+## 功能概览
+
+| 模块 | 功能 |
+|------|------|
+| [文案提取](docs/transcribe.md) | 解析分享链接 → 获取无水印视频 → 语音转写 → 返回文本 |
+| [图片去水印](docs/image.md) | 解析图集链接 → 获取高清无水印图片 → 裁剪/API 去水印 |
+
+## 项目结构
 
 ```
-用户分享链接 → 解析 _ROUTER_DATA → 获取无水印视频 URL → 百炼 paraformer-v2 转录 → 返回文本
+.
+├── packages/
+│   └── core/                    # 核心库（可独立发布）
+│       ├── src/transcribe/      # 文案提取模块（parser/downloader/transcriber）
+│       ├── src/image/           # 图片服务模块（解析下载/去水印）
+│       └── src/utils/           # 工具函数
+├── apps/
+│   └── api/                     # Express REST API 服务
+│       └── src/api/routes/      # 路由（video/transcribe/image）
+├── docs/                        # 功能文档
+├── package.json                 # workspaces 根配置
+└── pnpm-workspace.yaml          # pnpm workspace 配置
 ```
-
-参考实现: https://github.com/yzfly/douyin-mcp-server
 
 ## 快速开始
 
 ### 前置要求
 
 - Node.js 18+
+- pnpm
 
 ### 安装
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env
 # 编辑 .env 填入配置
 ```
@@ -27,101 +44,78 @@ cp .env.example .env
 ### 配置
 
 ```env
-# 阿里云百炼 API Key (必需)
+# 阿里云百炼 API Key (文案提取必需)
 # 获取地址: https://help.aliyun.com/zh/model-studio/get-api-key
 DASHSCOPE_API_KEY=sk-xxxx
 
 # 语音识别模型 (默认 paraformer-v2)
 DASHSCOPE_MODEL=paraformer-v2
+
+# 服务配置
+PORT=3000
+NODE_ENV=development
+TEMP_DIR=./tmp
 ```
 
 ### 运行
 
 ```bash
-# 开发模式
-npm run dev
+# 开发模式（热重载）
+pnpm dev
 
-# 构建并启动
-npm run build
-npm start
+# 构建所有包
+pnpm build
+
+# 启动生产服务
+pnpm start
 ```
 
-## API 接口
+## API 概览
 
-### 1. 解析链接
+### 文案提取
 
-```
-POST /api/parse
-Body: { "url": "https://v.douyin.com/xxxxx/" }
-```
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/parse` | 解析视频链接，返回视频信息 |
+| POST | `/api/download` | 下载无水印视频 |
+| DELETE | `/api/download/:fileName` | 删除视频文件 |
+| POST | `/api/transcribe` | 提取视频文案 |
 
-返回视频 ID、标题、无水印 URL
+### 图片服务
 
-### 2. 下载无水印视频
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/image/parse` | 解析图集链接，返回无水印图片列表 |
+| POST | `/api/image/download` | 下载单张图片 |
+| POST | `/api/image/remove-watermark` | 去除图片水印（crop / api 模式） |
+| DELETE | `/api/image/download/:fileName` | 删除图片文件 |
 
-```
-POST /api/download
-Body: { "url": "https://v.douyin.com/xxxxx/" }
-```
+### 通用
 
-### 3. 提取文案
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/health` | 健康检查 |
 
-```
-POST /api/transcribe
-Body: { "url": "https://v.douyin.com/xxxxx/" }
-```
-
-返回识别文本、视频 ID、标题
-
-### 4. 健康检查
-
-```
-GET /api/health
-```
-
-## 项目结构
-
-```
-src/
-├── index.ts                     # 入口文件
-├── parser/                      # 链接解析 (保留)
-│   └── douyin-parser.ts
-├── downloader/                  # 视频下载
-│   └── video-downloader.ts      # _ROUTER_DATA 解析 + 无水印 URL
-├── transcriber/                 # 语音识别
-│   ├── dashscope-transcriber.ts # 百炼 paraformer-v2 API
-│   └── audio-extractor.ts       # FFmpeg 音频提取 (备用)
-├── api/                         # API 层
-│   ├── index.ts
-│   ├── routes/
-│   │   ├── video.ts
-│   │   └── transcribe.ts
-│   └── middleware/
-│       ├── error-handler.ts
-│       └── request-logger.ts
-└── utils/                       # 工具函数
-    └── index.ts
-```
+详见 [docs/transcribe.md](docs/transcribe.md) 和 [docs/image.md](docs/image.md)。
 
 ## 技术细节
 
-### 视频 URL 提取
+### 视频/图集 URL 提取
 
-参考 [douyin-mcp-server](https://github.com/yzfly/douyin-mcp-server) 的方式:
-1. 跟随短链重定向，提取 video_id
-2. 访问 `https://www.iesdouyin.com/share/video/{video_id}`
-3. 从 `window._ROUTER_DATA` 中解析 `loaderData["video_(id)/page"]["videoInfoRes"]["item_list"][0]["video"]["play_addr"]["url_list"][0]`
-4. 将 URL 中的 `playwm` 替换为 `play` 得到无水印地址
+参考 [douyin-mcp-server](https://github.com/yzfly/douyin-mcp-server):
+1. 跟随短链重定向，提取 ID
+2. 访问 `https://www.iesdouyin.com/share/video/{id}`
+3. 从 `window._ROUTER_DATA` 中解析信息
+4. 视频 URL 将 `playwm` 替换为 `play` 得到无水印地址
+5. 图片 URL 替换模板参数得到高清无水印地址
 
 ### 语音识别
 
-使用阿里云百炼 `paraformer-v2` 模型:
-- 直接用视频 URL 调用百炼转录 API，无需下载视频到本地
-- 异步提交任务 → 轮询结果 → 获取 transcription_url → 提取文本
-- 模型: `paraformer-v2`，支持中英文识别
+使用阿里云百炼 `paraformer-v2` 模型，直接用视频 URL 调用转录 API，异步提交 → 轮询结果 → 提取文本。
 
 ## 注意事项
 
-- 需要有效的 DASHSCOPE_API_KEY (从阿里云百炼获取)
-- 百炼 API 按量计费，请参考 [定价文档](https://help.aliyun.com/zh/model-studio/developer-reference/paraformer)
+- 文案提取需要有效的 `DASHSCOPE_API_KEY`（从阿里云百炼获取）
+- 百炼 API 按量计费，参考 [定价文档](https://help.aliyun.com/zh/model-studio/developer-reference/paraformer)
 - 视频 URL 需要公网可访问，百炼服务端会直接抓取
+- 裁剪去水印依赖 `sharp`，首次安装会自动编译

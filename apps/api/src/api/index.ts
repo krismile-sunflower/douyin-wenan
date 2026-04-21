@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import videoRoutes from './routes/video';
 import transcribeRoutes from './routes/transcribe';
+import imageRoutes from './routes/image';
 
-const router = Router();
+const router: Router = Router();
 
-// 健康检查
 router.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -13,8 +13,8 @@ router.get('/health', (_req, res) => {
   });
 });
 
-// 挂载路由
 router.use('/', videoRoutes);
 router.use('/', transcribeRoutes);
+router.use('/', imageRoutes);
 
 export default router;
