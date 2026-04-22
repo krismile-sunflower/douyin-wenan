@@ -7,7 +7,7 @@
 | 模块 | 功能 |
 |------|------|
 | [文案提取](docs/transcribe.md) | 解析分享链接 → 获取无水印视频 → 语音转写 → 返回文本 |
-| [图片去水印](docs/image.md) | 解析图集链接 → 获取高清无水印图片 → 裁剪/API 去水印 |
+| [图片服务](docs/image.md) | 解析抖音图集/豆包对话链接 → 提取无水印原始图片 → 下载；本地图片像素修复去水印 |
 
 ## 项目结构
 
@@ -85,9 +85,9 @@ pnpm start
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/image/parse` | 解析图集链接，返回无水印图片列表 |
-| POST | `/api/image/download` | 下载单张图片 |
-| POST | `/api/image/remove-watermark` | 去除图片水印（crop / api 模式） |
+| POST | `/api/image/parse` | 解析抖音图集或豆包对话链接，返回无水印图片列表 |
+| POST | `/api/image/download` | 下载单张图片（支持 HTTP URL 和本地路径） |
+| POST | `/api/image/remove-watermark` | 去除本地图片水印（autoCrop / inpaint / smart / crop / api） |
 | DELETE | `/api/image/download/:fileName` | 删除图片文件 |
 
 ### 通用
