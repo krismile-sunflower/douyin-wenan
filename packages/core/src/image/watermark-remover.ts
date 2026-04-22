@@ -8,6 +8,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 export interface CropOptions {
   top?: number;
@@ -1776,52 +1780,337 @@ export class WatermarkRemover {
   }
 
   /**
+   * 计算水印区域的 mask 矩形（含 padding 扩展）
+   */
+  private computeMaskRect(
+    region: WatermarkRegion,
+    width: number,
+    height: number,
+    padding: number
+  ): { left: number; top: number; right: number; bottom: number } {
+    if (region.exactRect) {
+      return {
+        left: Math.max(0, region.exactRect.left - padding),
+        top: Math.max(0, region.exactRect.top - padding),
+        right: Math.min(width, region.exactRect.right + padding),
+        bottom: Math.min(height, region.exactRect.bottom + padding),
+      };
+    }
+    const cropL = region.crop.left || 0;
+    const cropT = region.crop.top || 0;
+    const cropR = region.crop.right || 0;
+    const cropB = region.crop.bottom || 0;
+    // 对底部/顶部水印：只在检测高度内向内扩展 padding，不横向扩展
+    // 这样 LaMa 只修复水印文字本身，不破坏背景渐变
+    return {
+      left:   cropB > 0 || cropT > 0 ? 0 : Math.max(0, cropL - padding),
+      top:    cropB > 0 ? Math.max(0, height - cropB - padding) : Math.max(0, cropT - padding),
+      right:  cropB > 0 || cropT > 0 ? width : Math.min(width, width - cropR + padding),
+      bottom: cropT > 0 ? Math.min(height, cropT + padding) : Math.min(height, height),
+    };
+  }
+
+  /**
+   * 使用 IOPaint (LaMa AI 模型) 去水印
+   * 效果远优于传统像素修复，需要 Python 3.8+ 和 IOPaint：
+   *   pip install iopaint
+   * 首次运行会自动下载 LaMa 模型（约 200MB）
+   */
+  async removeByLaMa(
+    imageUrlOrPath: string,
+    outputFileName?: string,
+    maskPadding: number = 20
+  ): Promise<WatermarkRemoveResult & { detectedRegion: WatermarkRegion }> {
+    try {
+      await execFileAsync('python', ['-m', 'iopaint', 'run', '--help'], { timeout: 10000 });
+    } catch (e: unknown) {
+      // iopaint run --help exits with code 1 but still prints help — that's fine
+      // Only fail if the module itself cannot be found
+      const msg = (e as { message?: string }).message || '';
+      if (msg.includes('No module named') || msg.includes('not found') || msg.includes('cannot find')) {
+        throw new Error(
+          'IOPaint 未安装，请运行: pip install iopaint\n首次运行会自动下载 LaMa 模型（约 200MB）'
+        );
+      }
+    }
+
+    let sharpInstance: ((input?: string | Buffer) => import('sharp').Sharp) | undefined;
+    try {
+      const sharpModule = await import('sharp');
+      sharpInstance = (sharpModule as unknown as { default: (input?: string | Buffer) => import('sharp').Sharp }).default;
+    } catch {
+      throw new Error('需要 sharp 依赖，请运行: pnpm add sharp');
+    }
+
+    const inputPath = await this.resolveInputPath(imageUrlOrPath);
+    const isTempInput = imageUrlOrPath.startsWith('http://') || imageUrlOrPath.startsWith('https://');
+
+    const batchId = Date.now().toString();
+    const batchInputDir  = path.join(this.tempDir, `lama_in_${batchId}`);
+    const batchMaskDir   = path.join(this.tempDir, `lama_mask_${batchId}`);
+    const batchOutputDir = path.join(this.tempDir, `lama_out_${batchId}`);
+
+    for (const dir of [batchInputDir, batchMaskDir, batchOutputDir]) {
+      await fs.promises.mkdir(dir, { recursive: true });
+    }
+
+    try {
+      const image = sharpInstance(inputPath);
+      const metadata = await image.metadata();
+      const width  = metadata.width  || 0;
+      const height = metadata.height || 0;
+      if (width === 0 || height === 0) throw new Error('无法读取图片尺寸');
+
+      const region = await this.detectWatermark(inputPath);
+      if (region.position === 'none' || region.confidence === 0) {
+        throw new Error('未检测到水印区域');
+      }
+
+      const baseFileName = `img_${batchId}.jpg`;
+      const maskFileName = `img_${batchId}.png`;
+
+      await fs.promises.copyFile(inputPath, path.join(batchInputDir, baseFileName));
+
+      const maskRect = this.computeMaskRect(region, width, height, maskPadding);
+      const maskBuffer = Buffer.alloc(width * height * 3, 0);
+      for (let y = maskRect.top; y < maskRect.bottom; y++) {
+        for (let x = maskRect.left; x < maskRect.right; x++) {
+          const idx = (y * width + x) * 3;
+          maskBuffer[idx] = maskBuffer[idx + 1] = maskBuffer[idx + 2] = 255;
+        }
+      }
+
+      const sharpMod = (await import('sharp')).default as ((input?: string | Buffer, options?: object) => import('sharp').Sharp);
+      await sharpMod(maskBuffer, { raw: { width, height, channels: 3 } })
+        .png()
+        .toFile(path.join(batchMaskDir, maskFileName));
+
+      await execFileAsync('python', [
+        '-m', 'iopaint', 'run',
+        '--model=lama',
+        '--device=cpu',
+        `--image=${batchInputDir}`,
+        `--mask=${batchMaskDir}`,
+        `--output=${batchOutputDir}`,
+      ], { timeout: 180000 });
+
+      const outputFiles = await fs.promises.readdir(batchOutputDir);
+      if (outputFiles.length === 0) throw new Error('IOPaint 未生成输出文件');
+
+      const outputName = outputFileName || `wm_lama_${Date.now()}.jpg`;
+      const outputPath = path.join(this.tempDir, outputName);
+      await fs.promises.copyFile(path.join(batchOutputDir, outputFiles[0]), outputPath);
+
+      const originalStats = fs.statSync(inputPath);
+      const outputStats   = fs.statSync(outputPath);
+
+      return {
+        outputPath,
+        method: 'inpaint',
+        originalSize: originalStats.size,
+        outputSize:   outputStats.size,
+        detectedRegion: region,
+      };
+    } finally {
+      for (const dir of [batchInputDir, batchMaskDir, batchOutputDir]) {
+        await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
+      if (isTempInput) await fs.promises.unlink(inputPath).catch(() => {});
+    }
+  }
+
+  /**
    * 智能去水印：自动检测水印位置并选择最佳去除方案
    * - 边缘水印(高置信度) → 裁剪（更快更干净）
-   * - 角落/中心水印 → 像素修复（保留画面完整）
+   * - 角落/中心水印 → IOPaint LaMa AI（效果最佳），失败时回退到像素修复
    */
   async removeBySmart(
     imageUrlOrPath: string,
     outputFileName?: string
   ): Promise<WatermarkRemoveResult & { detectedRegion: WatermarkRegion; strategy: 'crop' | 'inpaint' }> {
-    const region = await this.detectWatermark(
-      await this.resolveInputPath(imageUrlOrPath)
-    );
+    const inputPath = await this.resolveInputPath(imageUrlOrPath);
+    const region = await this.detectWatermark(inputPath);
 
     if (region.position === 'none' || region.confidence === 0) {
       throw new Error('未检测到水印区域，图片可能没有明显水印');
     }
 
-    // 策略选择逻辑
-    const edgePositions: WatermarkPosition[] = ['top', 'bottom', 'left', 'right'];
-    const cornerPositions: WatermarkPosition[] = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
+    // 判断水印区域是否为纯色/渐变背景条（方差低 → 裁剪更自然）
+    const { useCrop, actualCropPx } = await this.isPlainColorWatermark(inputPath, region);
 
-    let strategy: 'crop' | 'inpaint';
-    if (edgePositions.includes(region.position) && region.confidence > 0.75) {
-      strategy = 'crop';
-    } else if (cornerPositions.includes(region.position)) {
-      strategy = 'inpaint';
-    } else if (region.position === 'center-overlay') {
-      strategy = 'inpaint';
-    } else {
-      // 低置信度边缘水印也用 inpaint，避免误裁
-      strategy = 'inpaint';
+    if (useCrop) {
+      // 用扫描得到的真实高度裁剪，覆盖完整渐变区
+      const adjustedRegion = { ...region, crop: { ...region.crop } };
+      if (region.crop.bottom) adjustedRegion.crop.bottom = actualCropPx;
+      else if (region.crop.top) adjustedRegion.crop.top = actualCropPx;
+      else if (region.crop.left) adjustedRegion.crop.left = actualCropPx;
+      else if (region.crop.right) adjustedRegion.crop.right = actualCropPx;
+
+      const sharpMod = (await import('sharp')).default as ((input?: string | Buffer) => import('sharp').Sharp);
+      const meta = await sharpMod(inputPath).metadata();
+      const w = meta.width || 0, h = meta.height || 0;
+      const cropL = adjustedRegion.crop.left || 0;
+      const cropT = adjustedRegion.crop.top || 0;
+      const cropR = adjustedRegion.crop.right || 0;
+      const cropBt = adjustedRegion.crop.bottom || 0;
+      const outputName = outputFileName || `wm_smart_${Date.now()}.jpg`;
+      const outputPath = path.join(this.tempDir, outputName);
+      await sharpMod(inputPath)
+        .extract({ left: cropL, top: cropT, width: w - cropL - cropR, height: h - cropT - cropBt })
+        .toFile(outputPath);
+      const origStats = fs.statSync(inputPath);
+      const outStats = fs.statSync(outputPath);
+      return { outputPath, method: 'crop', originalSize: origStats.size, outputSize: outStats.size, detectedRegion: adjustedRegion, strategy: 'crop' };
     }
 
-    if (strategy === 'crop') {
-      const result = await this.removeByAutoCrop(imageUrlOrPath, outputFileName);
-      return {
-        ...result,
-        detectedRegion: result.detectedRegion,
-        strategy: 'crop',
-      };
-    } else {
+    // 叠在内容上的水印：优先 IOPaint LaMa AI，失败时回退到 JS 像素修复
+    try {
+      const result = await this.removeByLaMa(imageUrlOrPath, outputFileName);
+      return { ...result, strategy: 'inpaint' };
+    } catch {
       const result = await this.removeByInpaint(imageUrlOrPath, outputFileName);
       return {
         ...result,
         detectedRegion: result.detectedRegion,
         strategy: 'inpaint',
       };
+    }
+  }
+
+  /**
+   * 判断水印区域是否为纯色/渐变背景条（适合裁剪而非 inpaint）
+   * 比较水印区与内容区的方差比值：水印区纹理明显比内容区少 → 背景条，裁剪更干净
+   * 返回 { useCrop, actualCropPx } — actualCropPx 是向上扫描到内容区的真实高度
+   */
+  private async isPlainColorWatermark(
+    imagePath: string,
+    region: WatermarkRegion
+  ): Promise<{ useCrop: boolean; actualCropPx: number }> {
+    if (region.position === 'center-overlay') return { useCrop: false, actualCropPx: 0 };
+    const cropB = region.crop.bottom || 0;
+    const cropT = region.crop.top || 0;
+    const cropL = region.crop.left || 0;
+    const cropR = region.crop.right || 0;
+    const edgeCount = [cropB > 0, cropT > 0, cropL > 0, cropR > 0].filter(Boolean).length;
+    if (edgeCount !== 1) return { useCrop: false, actualCropPx: 0 };
+
+    try {
+      const sharpMod = (await import('sharp')).default as ((input?: string | Buffer) => import('sharp').Sharp);
+      const meta = await sharpMod(imagePath).metadata();
+      const w = meta.width || 0;
+      const h = meta.height || 0;
+      if (w === 0 || h === 0) return { useCrop: false, actualCropPx: 0 };
+
+      const calcStdDev = async (top: number, height: number, left: number, width: number) => {
+        const { data, info } = await sharpMod(imagePath)
+          .extract({ left, top, width, height })
+          .raw().toBuffer({ resolveWithObject: true });
+        const ch = info.channels || 3;
+        const total = width * height;
+        let lumSum = 0;
+        for (let i = 0; i < total; i++) {
+          const idx = i * ch;
+          lumSum += 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        }
+        const lumMean = lumSum / total;
+        let varSum = 0;
+        for (let i = 0; i < total; i++) {
+          const idx = i * ch;
+          const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+          varSum += (lum - lumMean) ** 2;
+        }
+        return Math.sqrt(varSum / total);
+      };
+
+      // 获取内容区方差（中间30%区域）
+      const refTop = Math.floor(h * 0.3);
+      const refHeight = Math.floor(h * 0.3);
+      const refStd = await calcStdDev(refTop, refHeight, 0, w);
+
+      let wmTop = 0, wmHeight = 0;
+      if (cropB > 0) { wmTop = h - cropB; wmHeight = cropB; }
+      else if (cropT > 0) { wmTop = 0; wmHeight = cropT; }
+      else if (cropL > 0) {
+        const wmStd = await calcStdDev(0, h, 0, cropL);
+        return { useCrop: wmStd < refStd * 0.75, actualCropPx: cropL };
+      } else {
+        const wmStd = await calcStdDev(0, h, w - cropR, cropR);
+        return { useCrop: wmStd < refStd * 0.75, actualCropPx: cropR };
+      }
+
+      const wmStd = await calcStdDev(wmTop, wmHeight, 0, w);
+      if (wmStd >= refStd * 0.75) return { useCrop: false, actualCropPx: 0 };
+
+      // 是背景条 → 向上/下扫描找到真实边界（逐行检测 std，直到超过内容区 std 的 70%）
+      const maxScan = Math.floor(h * 0.25);
+      const scanTop = cropB > 0 ? h - maxScan : 0;
+      const { data: scanData, info: scanInfo } = await sharpMod(imagePath)
+        .extract({ left: 0, top: scanTop, width: w, height: maxScan })
+        .raw().toBuffer({ resolveWithObject: true });
+      const sch = scanInfo.channels || 3;
+
+      const rowStd = (row: number) => {
+        let lumSum = 0;
+        for (let x = 0; x < w; x++) {
+          const idx = (row * w + x) * sch;
+          lumSum += 0.299 * scanData[idx] + 0.587 * scanData[idx + 1] + 0.114 * scanData[idx + 2];
+        }
+        const lm = lumSum / w;
+        let vs = 0;
+        for (let x = 0; x < w; x++) {
+          const idx = (row * w + x) * sch;
+          const l = 0.299 * scanData[idx] + 0.587 * scanData[idx + 1] + 0.114 * scanData[idx + 2];
+          vs += (l - lm) ** 2;
+        }
+        return Math.sqrt(vs / w);
+      };
+
+      // 从检测到的水印区域继续向上/下扫描，找到内容区真实起点
+      // 策略：从 cropPx 开始往上扩展，直到连续8行 std > refStd*0.85（高置信内容区）
+      const threshold = refStd * 0.85;
+      let actualCropPx = cropB > 0 ? cropB : cropT;
+      const startPx = actualCropPx;
+      if (cropB > 0) {
+        let consecContent = 0;
+        for (let extra = 1; extra <= maxScan - startPx; extra++) {
+          const fromBottom = startPx + extra;
+          const row = maxScan - fromBottom;
+          if (row < 0) break;
+          const s = rowStd(row);
+          if (s > threshold) {
+            consecContent++;
+            if (consecContent >= 8) {
+              actualCropPx = fromBottom - 8;
+              break;
+            }
+          } else {
+            consecContent = 0;
+            actualCropPx = fromBottom;
+          }
+        }
+      } else {
+        let consecContent = 0;
+        for (let extra = 1; extra <= maxScan - startPx; extra++) {
+          const fromTop = startPx + extra;
+          const row = fromTop - 1;
+          if (row >= maxScan) break;
+          const s = rowStd(row);
+          if (s > threshold) {
+            consecContent++;
+            if (consecContent >= 8) {
+              actualCropPx = fromTop - 8;
+              break;
+            }
+          } else {
+            consecContent = 0;
+            actualCropPx = fromTop;
+          }
+        }
+      }
+
+      return { useCrop: true, actualCropPx };
+    } catch {
+      return { useCrop: false, actualCropPx: 0 };
     }
   }
 
