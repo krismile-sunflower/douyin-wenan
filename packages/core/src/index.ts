@@ -20,6 +20,8 @@ export {
   type WatermarkRemoveResult,
   type CropOptions,
   type ApiConfig,
+  type WatermarkPosition,
+  type WatermarkRegion,
 } from './image';
 
 // 工具函数

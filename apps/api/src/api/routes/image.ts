@@ -89,10 +89,16 @@ router.post('/download', async (req: Request, res: Response, next) => {
 /**
  * POST /api/image/remove-watermark
  * 去除图片水印
- * 支持两种模式:
+ * 支持多种模式:
  * 1. crop: 通过裁剪去除固定位置水印
  *    { imageUrl, mode: 'crop', options: { top: 0, bottom: 100, left: 0, right: 0 } }
- * 2. api: 通过外部AI API去除水印
+ * 2. autoCrop: 自动检测水印位置并裁剪（支持顶部/底部/左侧/右侧/四角）
+ *    { imageUrl, mode: 'autoCrop' }
+ * 3. inpaint: 自动检测水印位置并像素修复（保留完整尺寸，支持任意位置）
+ *    { imageUrl, mode: 'inpaint' }
+ * 4. smart: 智能选择最佳去水印方案（自动检测 + 策略选择）
+ *    { imageUrl, mode: 'smart' }
+ * 5. api: 通过外部AI API去除水印
  *    { imageUrl, mode: 'api', apiConfig: { endpoint, apiKey } }
  */
 router.post('/remove-watermark', async (req: Request, res: Response, next) => {
@@ -107,10 +113,11 @@ router.post('/remove-watermark', async (req: Request, res: Response, next) => {
       return;
     }
 
-    if (!mode || !['crop', 'api'].includes(mode)) {
+    const validModes = ['crop', 'autoCrop', 'inpaint', 'smart', 'api'];
+    if (!mode || !validModes.includes(mode)) {
       res.status(400).json({
         success: false,
-        error: '请指定有效的去水印模式: crop 或 api',
+        error: `请指定有效的去水印模式: ${validModes.join(', ')}`,
       });
       return;
     }
@@ -118,44 +125,74 @@ router.post('/remove-watermark', async (req: Request, res: Response, next) => {
     let result;
     const outputFileName = generateFileName('wm_removed', 'jpg');
 
-    if (mode === 'crop') {
-      if (!options || typeof options !== 'object') {
-        res.status(400).json({
-          success: false,
-          error: 'crop 模式需要提供 options 参数',
-        });
-        return;
+    switch (mode) {
+      case 'crop': {
+        if (!options || typeof options !== 'object') {
+          res.status(400).json({
+            success: false,
+            error: 'crop 模式需要提供 options 参数',
+          });
+          return;
+        }
+        result = await watermarkRemover.removeByCrop(imageUrl, options, outputFileName);
+        break;
       }
 
-      result = await watermarkRemover.removeByCrop(
-        imageUrl,
-        options,
-        outputFileName
-      );
-    } else {
-      if (!apiConfig || !apiConfig.endpoint || !apiConfig.apiKey) {
-        res.status(400).json({
-          success: false,
-          error: 'api 模式需要提供 apiConfig.endpoint 和 apiConfig.apiKey',
-        });
-        return;
+      case 'autoCrop': {
+        const autoResult = await watermarkRemover.removeByAutoCrop(imageUrl, outputFileName);
+        result = {
+          outputPath: autoResult.outputPath,
+          method: autoResult.method,
+          originalSize: autoResult.originalSize,
+          outputSize: autoResult.outputSize,
+          detectedRegion: autoResult.detectedRegion,
+        };
+        break;
       }
 
-      result = await watermarkRemover.removeByApi(
-        imageUrl,
-        apiConfig,
-        outputFileName
-      );
+      case 'inpaint': {
+        const inpaintResult = await watermarkRemover.removeByInpaint(imageUrl, outputFileName);
+        result = {
+          outputPath: inpaintResult.outputPath,
+          method: inpaintResult.method,
+          originalSize: inpaintResult.originalSize,
+          outputSize: inpaintResult.outputSize,
+          repairedPixels: inpaintResult.repairedPixels,
+          detectedRegion: inpaintResult.detectedRegion,
+        };
+        break;
+      }
+
+      case 'smart': {
+        const smartResult = await watermarkRemover.removeBySmart(imageUrl, outputFileName);
+        result = {
+          outputPath: smartResult.outputPath,
+          method: smartResult.method,
+          originalSize: smartResult.originalSize,
+          outputSize: smartResult.outputSize,
+          detectedRegion: smartResult.detectedRegion,
+          strategy: smartResult.strategy,
+        };
+        break;
+      }
+
+      case 'api':
+      default: {
+        if (!apiConfig || !apiConfig.endpoint || !apiConfig.apiKey) {
+          res.status(400).json({
+            success: false,
+            error: 'api 模式需要提供 apiConfig.endpoint 和 apiConfig.apiKey',
+          });
+          return;
+        }
+        result = await watermarkRemover.removeByApi(imageUrl, apiConfig, outputFileName);
+        break;
+      }
     }
 
     res.json({
       success: true,
-      data: {
-        outputPath: result.outputPath,
-        method: result.method,
-        originalSize: result.originalSize,
-        outputSize: result.outputSize,
-      },
+      data: result,
     });
   } catch (error) {
     next(error);
