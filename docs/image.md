@@ -25,12 +25,14 @@ doubao.com/thread/xxx → 解析 data-fn-args JSON
     → image.image_ori_raw.url  ← 直接原始无水印 URL → 下载
 ```
 
-### 本地图片去水印（后备方案）
+### 图片去水印
 
 ```
-本地图片 → 自动检测水印位置 → inpaint 像素修复（sharp）
-本地图片 → 手动裁剪（crop）
-本地图片 → 外部 AI API 去水印
+上传文件 / HTTP 链接
+  → 自动检测水印区域
+    → 纯色/渐变背景条：扫描真实边界 → 直接裁剪（crop）
+    → 叠在内容上的水印：IOPaint LaMa AI 修复（inpaint）
+    → LaMa 不可用时：JS 像素修复（fallback）
 ```
 
 ## 核心模块
@@ -109,64 +111,34 @@ Content-Type: application/json
 }
 ```
 
-### 3. 去除图片水印
+### 3. 去除图片水印 — 上传文件
 
 > **说明**：通过 `/parse` + `/download` 获取的抖音/豆包图片本身已无水印，此接口用于处理其他来源的含水印图片。
 
-支持五种模式：
+上传本地图片文件，服务端自动识别水印并去除。
 
-| 模式 | 说明 |
+```
+POST /api/image/remove-watermark/upload
+Content-Type: multipart/form-data
+
+file=<图片文件>          # 必填，支持 JPEG/PNG/WebP/GIF，最大 20MB
+mode=smart              # 可选，默认 smart
+```
+
+**mode 取值：**
+
+| mode | 说明 |
 |------|------|
-| `autoCrop` | 自动检测水印位置并裁剪（推荐） |
-| `inpaint` | 自动检测并像素修复，保持原始尺寸 |
-| `smart` | 智能选择最佳方案 |
-| `crop` | 手动指定裁剪区域 |
-| `api` | 调用外部 AI 去水印服务 |
+| `smart`（默认） | 自动判断：纯色背景条 → 裁剪；叠加水印 → LaMa AI 修复 |
+| `autoCrop` | 强制裁剪 |
+| `inpaint` | 强制 LaMa AI 修复（需安装 IOPaint） |
 
-#### autoCrop / inpaint / smart 模式
+**示例（curl）：**
 
-```
-POST /api/image/remove-watermark
-Content-Type: application/json
-
-{
-  "imageUrl": "https://example.com/image.jpg",
-  "mode": "inpaint"
-}
-```
-
-#### crop 模式
-
-```
-POST /api/image/remove-watermark
-Content-Type: application/json
-
-{
-  "imageUrl": "https://example.com/image.jpg",
-  "mode": "crop",
-  "options": {
-    "top": 0,
-    "bottom": 100,
-    "left": 0,
-    "right": 0
-  }
-}
-```
-
-#### api 模式
-
-```
-POST /api/image/remove-watermark
-Content-Type: application/json
-
-{
-  "imageUrl": "https://example.com/image.jpg",
-  "mode": "api",
-  "apiConfig": {
-    "endpoint": "https://api.example.com/remove-watermark",
-    "apiKey": "your-api-key"
-  }
-}
+```bash
+curl -X POST http://localhost:3000/api/image/remove-watermark/upload \
+  -F "file=@/path/to/image.png" \
+  -F "mode=smart"
 ```
 
 **返回：**
@@ -175,15 +147,47 @@ Content-Type: application/json
 {
   "success": true,
   "data": {
-    "outputPath": "/project/tmp/wm_removed_1234567890.jpg",
-    "method": "inpaint",
-    "originalSize": 1048576,
-    "outputSize": 983040
+    "outputPath": "/project/tmp/wm_upload_1234567890.jpg",
+    "method": "crop",
+    "originalSize": 199249,
+    "outputSize": 184832,
+    "detectedRegion": {
+      "position": "bottom",
+      "confidence": 0.89,
+      "crop": { "bottom": 138 }
+    },
+    "strategy": "crop"
   }
 }
 ```
 
-### 4. 删除图片文件
+### 4. 去除图片水印 — 通过链接
+
+传入图片 HTTP 链接（或本地路径），服务端自动下载并处理。
+
+```
+POST /api/image/remove-watermark/url
+Content-Type: application/json
+
+{
+  "imageUrl": "https://example.com/image.jpg",
+  "mode": "smart"
+}
+```
+
+**示例（curl）：**
+
+```bash
+curl -X POST http://localhost:3000/api/image/remove-watermark/url \
+  -H "Content-Type: application/json" \
+  -d '{"imageUrl": "https://example.com/image.jpg", "mode": "smart"}'
+```
+
+**返回格式同上。**
+
+### 5. 删除图片文件
+
+### 6. 删除图片文件
 
 ```
 DELETE /api/image/download/image_1234567890.jpg
@@ -200,5 +204,7 @@ DELETE /api/image/download/image_1234567890.jpg
 
 1. **豆包链接无需去水印**：豆包 `image_ori_raw` 字段即为 AI 生成的原始图片，直接下载即可
 2. **抖音图集 URL 提取策略**：优先 `download_addr` 字段 → 筛选无水印 CDN 模板 → 去除 `~tplv-xxx` 参数 → fallback 到 `~tplv-ow360noawqhd.jpeg`
-3. **inpaint 依赖 sharp**：首次安装会编译原生模块，可能需要 Python 和 C++ 构建工具
-4. **API 模式需自备服务**：项目不内置 AI 去水印模型，需自行对接外部服务
+3. **去水印依赖**：`sharp`（自动编译，可能需要 Python + C++ 构建工具）；AI 修复模式额外需要 `pip install iopaint`
+4. **IOPaint LaMa 模型**：首次运行自动下载约 200MB，之后缓存在本地（HuggingFace 缓存目录）
+5. **smart 策略判断逻辑**：对比水印区与内容区的亮度方差，水印区方差 < 内容区 75% 则判定为纯色/渐变背景条使用裁剪，否则使用 LaMa AI 修复
+6. **API 模式需自备服务**：旧接口 `/remove-watermark` 保留，需自行对接外部 AI 去水印服务

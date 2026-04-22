@@ -1,4 +1,6 @@
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
+import * as path from 'path';
 import {
   ImageService,
   WatermarkRemover,
@@ -16,6 +18,18 @@ const imageService = new ImageService({
 });
 const watermarkRemover = new WatermarkRemover({
   tempDir: config.tempDir,
+});
+
+const upload = multer({
+  dest: path.join(config.tempDir, 'uploads'),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('仅支持 JPEG / PNG / WebP / GIF 格式'));
+    }
+  },
 });
 
 /**
@@ -193,6 +207,103 @@ router.post('/remove-watermark', async (req: Request, res: Response, next) => {
     res.json({
       success: true,
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/image/remove-watermark/upload
+ * 上传图片文件去水印
+ * Content-Type: multipart/form-data
+ * 字段: file (图片文件), mode (可选, 默认 smart)
+ */
+router.post('/remove-watermark/upload', upload.single('file'), async (req: Request, res: Response, next) => {
+  const uploadedPath = req.file?.path;
+  try {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: '请上传图片文件（字段名: file）' });
+      return;
+    }
+
+    const mode = (req.body.mode as string) || 'smart';
+    const validModes = ['smart', 'autoCrop', 'inpaint'];
+    if (!validModes.includes(mode)) {
+      res.status(400).json({ success: false, error: `mode 仅支持: ${validModes.join(', ')}` });
+      return;
+    }
+
+    const outputFileName = generateFileName('wm_upload', 'jpg');
+    let result;
+
+    if (mode === 'autoCrop') {
+      result = await watermarkRemover.removeByAutoCrop(uploadedPath!, outputFileName);
+    } else if (mode === 'inpaint') {
+      result = await watermarkRemover.removeByInpaint(uploadedPath!, outputFileName);
+    } else {
+      result = await watermarkRemover.removeBySmart(uploadedPath!, outputFileName);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        outputPath: result.outputPath,
+        method: result.method,
+        originalSize: result.originalSize,
+        outputSize: result.outputSize,
+        detectedRegion: (result as { detectedRegion?: unknown }).detectedRegion,
+        strategy: (result as { strategy?: unknown }).strategy,
+      },
+    });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (uploadedPath) safeDelete(uploadedPath).catch(() => {});
+  }
+});
+
+/**
+ * POST /api/image/remove-watermark/url
+ * 通过图片链接去水印
+ * Body: { imageUrl: string, mode?: 'smart' | 'autoCrop' | 'inpaint' }
+ */
+router.post('/remove-watermark/url', async (req: Request, res: Response, next) => {
+  try {
+    const { imageUrl, mode = 'smart' } = req.body;
+
+    if (!imageUrl || typeof imageUrl !== 'string') {
+      res.status(400).json({ success: false, error: '请提供有效的图片链接 imageUrl' });
+      return;
+    }
+
+    const validModes = ['smart', 'autoCrop', 'inpaint'];
+    if (!validModes.includes(mode)) {
+      res.status(400).json({ success: false, error: `mode 仅支持: ${validModes.join(', ')}` });
+      return;
+    }
+
+    const outputFileName = generateFileName('wm_url', 'jpg');
+    let result;
+
+    if (mode === 'autoCrop') {
+      result = await watermarkRemover.removeByAutoCrop(imageUrl, outputFileName);
+    } else if (mode === 'inpaint') {
+      result = await watermarkRemover.removeByInpaint(imageUrl, outputFileName);
+    } else {
+      result = await watermarkRemover.removeBySmart(imageUrl, outputFileName);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        outputPath: result.outputPath,
+        method: result.method,
+        originalSize: result.originalSize,
+        outputSize: result.outputSize,
+        detectedRegion: (result as { detectedRegion?: unknown }).detectedRegion,
+        strategy: (result as { strategy?: unknown }).strategy,
+      },
     });
   } catch (error) {
     next(error);

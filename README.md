@@ -87,7 +87,9 @@ pnpm start
 |------|------|------|
 | POST | `/api/image/parse` | 解析抖音图集或豆包对话链接，返回无水印图片列表 |
 | POST | `/api/image/download` | 下载单张图片（支持 HTTP URL 和本地路径） |
-| POST | `/api/image/remove-watermark` | 去除本地图片水印（autoCrop / inpaint / smart / crop / api） |
+| POST | `/api/image/remove-watermark` | 去除图片水印 — 旧接口，通过 `imageUrl` 传本地路径或 HTTP 链接 |
+| POST | `/api/image/remove-watermark/upload` | **上传文件**去水印（multipart/form-data，字段 `file`） |
+| POST | `/api/image/remove-watermark/url` | **通过链接**去水印（JSON body `imageUrl`） |
 | DELETE | `/api/image/download/:fileName` | 删除图片文件 |
 
 ### 通用
@@ -118,4 +120,5 @@ pnpm start
 - 文案提取需要有效的 `DASHSCOPE_API_KEY`（从阿里云百炼获取）
 - 百炼 API 按量计费，参考 [定价文档](https://help.aliyun.com/zh/model-studio/developer-reference/paraformer)
 - 视频 URL 需要公网可访问，百炼服务端会直接抓取
-- 裁剪去水印依赖 `sharp`，首次安装会自动编译
+- 去水印依赖 `sharp`（自动编译）；AI 修复模式额外需要 Python 3.8+ 和 `pip install iopaint`
+- IOPaint LaMa 模型首次运行会自动下载约 200MB，之后缓存本地
