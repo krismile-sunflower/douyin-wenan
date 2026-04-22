@@ -45,6 +45,8 @@ export interface WatermarkRegion {
   confidence: number;
   /** 检测到的区域像素尺寸 */
   pixelSize: { width: number; height: number };
+  /** 精确矩形区域（绝对像素坐标），优先于 crop 用于 inpaint */
+  exactRect?: { left: number; top: number; right: number; bottom: number };
 }
 
 export class WatermarkRemover {
@@ -107,14 +109,14 @@ export class WatermarkRemover {
   }
 
   /**
-   * 自动检测水印高度
-   * 基于像素方差分析，从下往上扫描寻找水印边界
+   * 自动检测水印高度（v2）
+   * 亮度分析优先（适配抖音黑条/渐变条），stdDev 作为兜底
    */
   private async detectWatermarkHeight(
     imagePath: string,
-    maxScanRatio: number = 0.15,
+    maxScanRatio: number = 0.20,
     minHeight: number = 5,
-    maxCropRatio: number = 0.08
+    maxCropRatio: number = 0.20
   ): Promise<number> {
     let sharpInstance: ((input?: string | Buffer) => import('sharp').Sharp) | undefined;
     try {
@@ -131,8 +133,8 @@ export class WatermarkRemover {
 
     if (width === 0 || height === 0) return 0;
 
-    const maxCropHeight = Math.max(Math.floor(height * maxCropRatio), 30);
-    const scanHeight = Math.min(Math.floor(height * maxScanRatio), 200);
+    const maxCropHeight = Math.floor(height * maxCropRatio);
+    const scanHeight = Math.min(Math.floor(height * maxScanRatio), 300);
     const startY = height - scanHeight;
 
     const { data, info } = await image
@@ -143,118 +145,81 @@ export class WatermarkRemover {
     const channels = info.channels || 3;
     const bytesPerRow = width * channels;
 
-    const calcRowStdDev = (row: number): number => {
-      const rowStart = row * bytesPerRow;
-      let rSum = 0, gSum = 0, bSum = 0;
-      for (let x = 0; x < width; x++) {
-        const idx = rowStart + x * channels;
-        rSum += data[idx]; gSum += data[idx + 1]; bSum += data[idx + 2];
-      }
-      const rM = rSum / width, gM = gSum / width, bM = bSum / width;
-      let v = 0;
-      for (let x = 0; x < width; x++) {
-        const idx = rowStart + x * channels;
-        v += (data[idx] - rM) ** 2 + (data[idx + 1] - gM) ** 2 + (data[idx + 2] - bM) ** 2;
-      }
-      return Math.sqrt(v / (width * 3));
-    };
-
-    const calcRegionStdDev = (row: number, xStart: number, xEnd: number): number => {
-      const rowStart = row * bytesPerRow;
-      const n = xEnd - xStart;
-      let rS = 0, gS = 0, bS = 0;
-      for (let x = xStart; x < xEnd; x++) {
-        const idx = rowStart + x * channels;
-        rS += data[idx]; gS += data[idx + 1]; bS += data[idx + 2];
-      }
-      const rM = rS / n, gM = gS / n, bM = bS / n;
-      let v = 0;
-      for (let x = xStart; x < xEnd; x++) {
-        const idx = rowStart + x * channels;
-        v += (data[idx] - rM) ** 2 + (data[idx + 1] - gM) ** 2 + (data[idx + 2] - bM) ** 2;
-      }
-      return Math.sqrt(v / (n * 3));
-    };
-
-    const rowStdDevs: number[] = [];
+    const rowLuminance: number[] = [];
+    const rowStdDev: number[] = [];
     for (let row = 0; row < scanHeight; row++) {
-      rowStdDevs.push(calcRowStdDev(row));
+      let lumSum = 0;
+      for (let x = 0; x < width; x++) {
+        const idx = row * bytesPerRow + x * channels;
+        lumSum += 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+      }
+      const lumMean = lumSum / width;
+      rowLuminance.push(lumMean);
+      let varSum = 0;
+      for (let x = 0; x < width; x++) {
+        const idx = row * bytesPerRow + x * channels;
+        const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        varSum += (lum - lumMean) ** 2;
+      }
+      rowStdDev.push(Math.sqrt(varSum / width));
     }
 
-    // 参考区域：扫描区域上半部分
+    // Method 1: 暗色条检测 — 从底部向上连续低亮度行（抖音黑条）
+    const darkThresh = 80;
+    let darkRows = 0;
+    for (let i = scanHeight - 1; i >= 0; i--) {
+      if (rowLuminance[i] < darkThresh) darkRows++;
+      else break;
+    }
+    if (darkRows >= minHeight) {
+      // 向上延伸：低亮度或低方差的渐变过渡行也纳入
+      let topRow = scanHeight - darkRows;
+      for (let i = topRow - 1; i >= Math.max(0, topRow - 20); i--) {
+        if (rowLuminance[i] < 120 || rowStdDev[i] < 15) { darkRows++; topRow = i; }
+        else break;
+      }
+      const total = Math.min(darkRows, maxCropHeight);
+      if (total >= minHeight) return total;
+    }
+
+    // Method 2: 梯度跌落检测 — 亮度骤降后维持低位（渐变黑条）
+    const win = 5;
+    let bestDrop = 0, bestDropRow = -1;
+    for (let i = win; i < scanHeight - win; i++) {
+      let above = 0, below = 0;
+      for (let j = 0; j < win; j++) { above += rowLuminance[i - j - 1]; below += rowLuminance[i + j]; }
+      above /= win; below /= win;
+      const drop = above - below;
+      if (drop > bestDrop && below < 120) { bestDrop = drop; bestDropRow = i; }
+    }
+    if (bestDropRow >= 0 && bestDrop > 40) {
+      const total = Math.min(scanHeight - bestDropRow, maxCropHeight);
+      if (total >= minHeight) return total;
+    }
+
+    // Method 3: StdDev 兜底（文字/Logo 水印，低对比度区域）
     const refEnd = Math.floor(scanHeight * 0.5);
     let refSum = 0;
-    for (let i = 0; i < refEnd; i++) refSum += rowStdDevs[i];
+    for (let i = 0; i < refEnd; i++) refSum += rowStdDev[i];
     const refStdDev = refSum / refEnd;
     if (refStdDev < 1) return 0;
 
-    // Step 1: 检测底部纯色区域（stdDev < 10）
     let pureHeight = 0;
     for (let i = scanHeight - 1; i >= 0; i--) {
-      if (rowStdDevs[i] < 10) pureHeight++;
+      if (rowStdDev[i] < 20) pureHeight++;
       else break;
     }
-
-    // Step 2: 从纯色区域上方，用差分突变找水印上边界
-    if (pureHeight > 0) {
-      const searchStart = scanHeight - 1 - pureHeight;
-      let maxDiff = 0;
-      let boundaryRow = -1;
-      const win = 3;
-
-      for (let i = searchStart; i >= win * 2; i--) {
-        let below = 0, above = 0;
-        for (let j = 0; j < win; j++) {
-          below += rowStdDevs[i - j];
-          above += rowStdDevs[i - win - j];
-        }
-        const diff = (above - below) / win;
-        if (diff > maxDiff) {
-          maxDiff = diff;
-          boundaryRow = i - win;
-        }
-      }
-
-      if (boundaryRow >= 0 && maxDiff > 3) {
-        const total = Math.min(scanHeight - boundaryRow, maxCropHeight);
-        return total >= minHeight ? total : 0;
-      }
-
-      const fallback = Math.min(pureHeight, maxCropHeight);
-      return fallback >= minHeight ? fallback : 0;
+    if (pureHeight >= minHeight) {
+      const total = Math.min(pureHeight, maxCropHeight);
+      if (total >= minHeight) return total;
     }
 
-    // Step 3: 没有纯色底部，用左右对比检测
-    const rightStart = Math.floor(width * 0.75);
-    const leftEnd = Math.floor(width * 0.25);
-
-    let watermarkTopRow = -1;
-    for (let i = scanHeight - 1; i >= 3; i--) {
-      const rightStd = calcRegionStdDev(i, rightStart, width);
-      const leftStd = calcRegionStdDev(i, 0, leftEnd);
-      const aboveRightStd = calcRegionStdDev(Math.max(i - 3, 0), rightStart, width);
-
-      const dropRatio = rightStd / Math.max(aboveRightStd, 1);
-      const lrRatio = rightStd / Math.max(leftStd, 1);
-
-      if (dropRatio < 0.8 && lrRatio < 0.8) {
-        watermarkTopRow = i;
-        break;
-      }
-    }
-
-    if (watermarkTopRow >= 0) {
-      const total = Math.min(scanHeight - watermarkTopRow, maxCropHeight);
-      return total >= minHeight ? total : 0;
-    }
-
-    // Step 4: 兜底 - 差分突变检测
     for (let i = scanHeight - 1; i >= 5; i--) {
-      const below = (rowStdDevs[i] + rowStdDevs[i - 1] + rowStdDevs[i - 2]) / 3;
-      const above = (rowStdDevs[i - 3] + rowStdDevs[i - 4] + rowStdDevs[i - 5]) / 3;
+      const below = (rowStdDev[i] + rowStdDev[i - 1] + rowStdDev[i - 2]) / 3;
+      const above = (rowStdDev[i - 3] + rowStdDev[i - 4] + rowStdDev[i - 5]) / 3;
       if (above - below > 8 && below < refStdDev * 0.7) {
         const total = Math.min(scanHeight - i, maxCropHeight);
-        return total >= minHeight ? total : 0;
+        if (total >= minHeight) return total;
       }
     }
 
@@ -283,12 +248,13 @@ export class WatermarkRemover {
       return { position: 'none', crop: {}, confidence: 0, pixelSize: { width: 0, height: 0 } };
     }
 
-    // 并行检测所有位置
-    const [bottomResult, topResult, leftResult, rightResult] = await Promise.all([
+    // 并行检测所有位置（包括直接角落检测）
+    const [bottomResult, topResult, leftResult, rightResult, cornerLogoResults] = await Promise.all([
       this.detectBottomWatermark(imagePath),
       this.detectTopWatermark(imagePath),
       this.detectLeftWatermark(imagePath),
       this.detectRightWatermark(imagePath),
+      this.detectCornerLogos(imagePath),
     ]);
 
     const cornerResult = this.detectCornerWatermarks(bottomResult, topResult, leftResult, rightResult, width, height);
@@ -297,7 +263,7 @@ export class WatermarkRemover {
     // 收集所有有效检测结果，按置信度排序
     const candidates: WatermarkRegion[] = [
       bottomResult, topResult, leftResult, rightResult,
-      ...cornerResult, centerResult,
+      ...cornerResult, ...cornerLogoResults, centerResult,
     ].filter(r => r.position !== 'none' && r.confidence > 0);
 
     if (candidates.length === 0) {
@@ -632,6 +598,127 @@ export class WatermarkRemover {
     return { position: 'none', crop: {}, confidence: 0, pixelSize: { width: 0, height: 0 } };
   }
 
+  /**
+   * 直接角落水印检测
+   * 对4个角落（各取 max(12%, 80px) × max(12%, 80px) 区域）分析亮度/纹理特征。
+   * 适配"AI生成"类半透明 logo pill 水印。
+   * 检测策略：
+   *   1. 计算角落区域的平均亮度与相邻非角落区域的对比
+   *   2. 如果角落区域比周围更亮（白色 logo）或更低方差（半透明平滑 overlay），判定为水印
+   *   3. 缩小到实际低方差/高亮度子区域，输出精确边界
+   */
+  private async detectCornerLogos(imagePath: string): Promise<WatermarkRegion[]> {
+    let sharpInstance: ((input?: string | Buffer) => import('sharp').Sharp) | undefined;
+    try {
+      const sharpModule = await import('sharp');
+      sharpInstance = (sharpModule as unknown as { default: (input?: string | Buffer) => import('sharp').Sharp }).default;
+    } catch {
+      return [];
+    }
+
+    const metadata = await sharpInstance(imagePath).metadata();
+    const imgW = metadata.width || 0;
+    const imgH = metadata.height || 0;
+    if (imgW === 0 || imgH === 0) return [];
+
+    // Strategy: scan the bottom-right and bottom-left corners (bottom 15%, each half)
+    // for a badge-like overlay using a large tile approach:
+    // Compare tile mean to the mean of the same columns above the tile.
+    // Badge = darker than rows above it + area < 15% of image.
+    const scanH = Math.max(Math.floor(imgH * 0.15), 100);
+    const scanTop = imgH - scanH;
+    // We need extra rows above the scan area as reference
+    const refH = 40;
+    const fullExtractTop = Math.max(0, scanTop - refH - 10);
+    const fullExtractH = imgH - fullExtractTop;
+
+    const { data, info } = await sharpInstance(imagePath)
+      .extract({ left: 0, top: fullExtractTop, width: imgW, height: fullExtractH })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const ch = info.channels;
+    // Offset: scan strip starts at (scanTop - fullExtractTop) within data
+    const dataOffset = scanTop - fullExtractTop;
+    const refOffset = dataOffset - refH - 5; // rows above scan strip used as reference
+
+    // Mean luminance of a rectangle (row, col in extracted data coords)
+    const rectMean = (left: number, top: number, w: number, h: number) => {
+      let s = 0;
+      for (let dy = 0; dy < h; dy++) {
+        for (let dx = 0; dx < w; dx++) {
+          const idx = ((top + dy) * imgW + (left + dx)) * ch;
+          s += 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        }
+      }
+      return s / (w * h);
+    };
+
+    // Tile parameters: look for large tiles (badge is ~90×180px)
+    // Use tiles of several fixed sizes common for AI-generated badges
+    const tileSizes: Array<[number, number]> = [
+      [180, 90], [160, 80], [140, 70], [200, 100], [220, 90],
+    ];
+    const results: WatermarkRegion[] = [];
+
+    // Only check bottom-right corner (TikTok "AI生成" badge is always there)
+    const cornerXStart = Math.floor(imgW * 0.45);
+
+    for (const [tW, tH] of tileSizes) {
+      let bestScore = -1;
+      let bestTx = -1, bestTy = -1;
+
+      // Slide tile across bottom-right region
+      for (let tx = cornerXStart; tx + tW <= imgW; tx += Math.max(10, Math.floor(tW * 0.2))) {
+        for (let ty = dataOffset; ty + tH <= dataOffset + scanH; ty += Math.max(8, Math.floor(tH * 0.2))) {
+          const tileMean = rectMean(tx, ty, tW, tH);
+          const aboveMean = refOffset >= 0 ? rectMean(tx, refOffset, tW, refH) : tileMean + 30; // assume darker if no ref
+          const diff = aboveMean - tileMean; // positive = tile is darker
+          // Score: ratio of darkness difference, penalized by nothing (we accept any dark badge)
+          const score = diff / 80.0;
+          if (score > bestScore) {
+            bestScore = score;
+            bestTx = tx; bestTy = ty;
+          }
+        }
+      }
+
+      if (bestScore < 0.25 || bestTx < 0) continue; // diff must be at least 20px (0.25 * 80)
+
+      // Convert to full image coordinates
+      const fullTop = fullExtractTop + bestTy;
+      const fullBottom = fullTop + tH;
+      const fullLeft = bestTx;
+      const fullRight = fullLeft + tW;
+
+      // Sanity: badge area must be < 12% of image
+      if (tW * tH > imgW * imgH * 0.12) continue;
+      // Sanity: badge must not extend past image bounds
+      if (fullBottom > imgH || fullRight > imgW) continue;
+
+      const confidence = Math.min(0.88, 0.55 + bestScore * 0.8);
+      // Extend the fill region to fully cover badge rounded-corner transition.
+      // topPad: covers the fuzzy top edge of the badge.
+      // leftPad: covers the fuzzy left edge; use ~25% of tile width for safety.
+      const topPad  = Math.max(20, Math.floor(tH * 0.22));
+      const leftPad = Math.max(30, Math.floor(tW * 0.25));
+      results.push({
+        position: 'bottom-right',
+        crop: { top: 0, bottom: imgH - fullBottom, left: 0, right: imgW - fullRight },
+        confidence,
+        pixelSize: { width: tW, height: tH },
+        exactRect: {
+          left:   Math.max(0, fullLeft - leftPad),
+          top:    Math.max(0, fullTop  - topPad),
+          right:  imgW,
+          bottom: imgH,
+        },
+      });
+      break; // Use the first (largest) tile size that finds something
+    }
+
+    return results;
+  }
+
   /** 基于边缘检测结果推断角部水印 */
   private detectCornerWatermarks(
     bottom: WatermarkRegion,
@@ -781,8 +868,8 @@ export class WatermarkRemover {
 
     const lowVarRatio = lowVarCount / Math.max(gridCount, 1);
 
-    // 如果中心区域有大面积低方差但不是整图均匀，可能是叠加水印
-    if (lowVarRatio > 0.15 && lowVarRatio < 0.7 && avgStdDev > 15) {
+    // 提高阈值避免误检：要求 ≥35% 格子低方差且图像整体有明显纹理
+    if (lowVarRatio > 0.35 && lowVarRatio < 0.65 && avgStdDev > 20) {
       // 找低方差区域的边界框
       let minGC = gridCols, maxGC = 0, minGR = gridRows, maxGR = 0;
       for (let gr = 0; gr < gridRows; gr++)
@@ -797,10 +884,16 @@ export class WatermarkRemover {
       const wmRight = (width - marginX) - Math.floor((maxGC + 1) * gridSize);
       const wmBottom = (height - marginY) - Math.floor((maxGR + 1) * gridSize);
 
+      // 仅当检测区域面积 < 图像面积的 40% 才认为是真实水印
+      const detectedArea = (width - wmLeft - wmRight) * (height - wmTop - wmBottom);
+      if (detectedArea > width * height * 0.40) {
+        return { position: 'none', crop: {}, confidence: 0, pixelSize: { width: 0, height: 0 } };
+      }
+
       return {
         position: 'center-overlay',
         crop: { top: wmTop, bottom: wmBottom, left: wmLeft, right: wmRight },
-        confidence: Math.min(0.6, lowVarRatio * 0.8),
+        confidence: Math.min(0.45, lowVarRatio * 0.7),
         pixelSize: { width: width - wmLeft - wmRight, height: height - wmTop - wmBottom },
       };
     }
@@ -1062,12 +1155,60 @@ export class WatermarkRemover {
       const wmRight = region.crop.right || 0;
 
       // 水印区域在原图中的像素坐标范围
-      const wmStartRow = wmTop;
-      const wmEndRow = height - wmBottom;
-      const wmStartCol = wmLeft;
-      const wmEndCol = width - wmRight;
+      // crop.top=N 表示水印在顶部，行范围 [0, N)，列范围全图
+      // crop.bottom=N 表示水印在底部，行范围 [height-N, height)，列范围全图
+      // crop.left=N 表示水印在左侧，列范围 [0, N)，行范围全图
+      // crop.right=N 表示水印在右侧，列范围 [width-N, width)，行范围全图
+      // 角落水印：多个方向同时有值，每个方向单独修复
 
-      this.advancedInpaint(data, width, height, channels, bytesPerRow, wmStartRow, wmEndRow, wmStartCol, wmEndCol);
+      const inpaintRegions: [number, number, number, number][] = [];
+
+      // If exactRect is provided, use gradient fill (better for corner badges on gradient background)
+      if (region.exactRect) {
+        const r = region.exactRect;
+        this.gradientFillRegion(data, width, height, channels, r.left, r.top, r.right, r.bottom);
+        const repairedPixels = (r.right - r.left) * (r.bottom - r.top);
+
+        const outputName = outputFileName || `wm_inpaint_${Date.now()}.jpg`;
+        const outputPath = path.join(this.tempDir, outputName);
+
+        const sharpMod = (await import('sharp')).default || (await import('sharp'));
+        await sharpMod(Buffer.from(data), {
+          raw: { width, height, channels: channels as 1 | 2 | 3 | 4 },
+        })
+          .jpeg({ quality: 95 })
+          .toFile(outputPath);
+
+        const originalStats = fs.statSync(inputPath);
+        const outputStats = fs.statSync(outputPath);
+
+        if (isTempInput) {
+          await fs.promises.unlink(inputPath).catch(() => {});
+        }
+
+        return {
+          outputPath,
+          method: 'inpaint',
+          originalSize: originalStats.size,
+          outputSize: outputStats.size,
+          repairedPixels,
+          detectedRegion: region,
+        };
+      }
+
+      if (wmTop > 0) inpaintRegions.push([0, wmTop, 0, width]);
+      if (wmBottom > 0) inpaintRegions.push([height - wmBottom, height, 0, width]);
+      if (wmLeft > 0) inpaintRegions.push([0, height, 0, wmLeft]);
+      if (wmRight > 0) inpaintRegions.push([0, height, width - wmRight, width]);
+      if (inpaintRegions.length === 0) {
+        inpaintRegions.push([0, height, 0, width]);
+      }
+
+      for (const [sr, er, sc, ec] of inpaintRegions) {
+        this.advancedInpaint(data, width, height, channels, bytesPerRow, sr, er, sc, ec);
+      }
+
+      const repairedPixels = inpaintRegions.reduce((sum, [sr, er, sc, ec]) => sum + (er - sr) * (ec - sc), 0);
 
       const outputName = outputFileName || `wm_inpaint_${Date.now()}.jpg`;
       const outputPath = path.join(this.tempDir, outputName);
@@ -1081,8 +1222,6 @@ export class WatermarkRemover {
 
       const originalStats = fs.statSync(inputPath);
       const outputStats = fs.statSync(outputPath);
-
-      const repairedPixels = (wmEndRow - wmStartRow) * (wmEndCol - wmStartCol);
 
       if (isTempInput) {
         await fs.promises.unlink(inputPath).catch(() => {});
@@ -1105,8 +1244,287 @@ export class WatermarkRemover {
   }
 
   /**
-   * 高级 inpaint 算法核心实现
-   * 支持任意矩形水印区域: Patch匹配填充 -> 多方向纹理传播 -> 边缘感知细化 -> 双边滤波平滑
+   * 批处理 inpaint（大面积水印快速路径）
+   * 以 patchSize 为步长处理块中心，减少 49 倍迭代量；
+   * 使用修复后的 patchSSD（来源侧严格要求干净像素）+ 随机全局采样
+   */
+  private batchPatchInpaint(
+    data: Buffer,
+    width: number,
+    height: number,
+    channels: number,
+    bytesPerRow: number,
+    wmStartRow: number,
+    wmEndRow: number,
+    wmStartCol: number,
+    wmEndCol: number
+  ): void {
+    const wmHeight = wmEndRow - wmStartRow;
+    const wmWidth = wmEndCol - wmStartCol;
+    if (wmHeight <= 0 || wmWidth <= 0) return;
+
+    const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+    const px = (r: number, c: number, ch: number) => r * bytesPerRow + c * channels + ch;
+    const isValid = (r: number, c: number) => r >= 0 && r < height && c >= 0 && c < width;
+    const isWm = (r: number, c: number) =>
+      r >= wmStartRow && r < wmEndRow && c >= wmStartCol && c < wmEndCol;
+
+    const output = Buffer.from(data);
+    const patchSize = 8;
+    const halfPatch = Math.floor(patchSize / 2);
+
+    const patchSSD = (r1: number, c1: number, r2: number, c2: number): number => {
+      let sum = 0, count = 0;
+      for (let dr = -halfPatch; dr <= halfPatch; dr++) {
+        for (let dc = -halfPatch; dc <= halfPatch; dc++) {
+          const ar = r1 + dr, ac = c1 + dc;
+          const br = r2 + dr, bc = c2 + dc;
+          if (!isValid(ar, ac) || !isValid(br, bc)) continue;
+          if (isWm(br, bc)) continue;
+          if (isWm(ar, ac)) continue;
+          const d0 = data[px(ar, ac, 0)] - data[px(br, bc, 0)];
+          const d1 = data[px(ar, ac, 1)] - data[px(br, bc, 1)];
+          const d2 = data[px(ar, ac, 2)] - data[px(br, bc, 2)];
+          sum += d0 * d0 + d1 * d1 + d2 * d2;
+          count++;
+        }
+      }
+      return count >= halfPatch ? sum / count : Infinity;
+    };
+
+    const sStep = Math.max(3, Math.floor(Math.sqrt(width * height) / 12));
+    const srcPool: [number, number][] = [];
+    for (let r = halfPatch; r < height - halfPatch; r += sStep) {
+      for (let c = halfPatch; c < width - halfPatch; c += sStep) {
+        if (!isWm(r, c)) srcPool.push([r, c]);
+      }
+    }
+    for (let i = srcPool.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      [srcPool[i], srcPool[j]] = [srcPool[j], srcPool[i]];
+    }
+    const rndSample = srcPool.slice(0, 200);
+
+    const sweepStep = Math.max(3, halfPatch);
+    const sweepRange = Math.min(Math.max(wmHeight, wmWidth) + 100, 300);
+
+    for (let row = wmStartRow; row < wmEndRow; row += patchSize) {
+      for (let col = wmStartCol; col < wmEndCol; col += patchSize) {
+        const cr = Math.min(row + halfPatch, wmEndRow - 1);
+        const cc = Math.min(col + halfPatch, wmEndCol - 1);
+
+        let bestSSD = Infinity, bestSR = -1, bestSC = -1;
+
+        if (wmStartRow > halfPatch) {
+          const from = Math.max(halfPatch, wmStartRow - sweepRange);
+          for (let sr = wmStartRow - 1; sr >= from; sr -= sweepStep) {
+            const ssd = patchSSD(cr, cc, sr, cc);
+            if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = cc; }
+          }
+        }
+        if (wmEndRow < height - halfPatch) {
+          const to = Math.min(height - halfPatch - 1, wmEndRow + sweepRange);
+          for (let sr = wmEndRow; sr <= to; sr += sweepStep) {
+            const ssd = patchSSD(cr, cc, sr, cc);
+            if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = cc; }
+          }
+        }
+        if (wmStartCol > halfPatch) {
+          const from = Math.max(halfPatch, wmStartCol - sweepRange);
+          for (let sc = wmStartCol - 1; sc >= from; sc -= sweepStep) {
+            const ssd = patchSSD(cr, cc, cr, sc);
+            if (ssd < bestSSD) { bestSSD = ssd; bestSR = cr; bestSC = sc; }
+          }
+        }
+        if (wmEndCol < width - halfPatch) {
+          const to = Math.min(width - halfPatch - 1, wmEndCol + sweepRange);
+          for (let sc = wmEndCol; sc <= to; sc += sweepStep) {
+            const ssd = patchSSD(cr, cc, cr, sc);
+            if (ssd < bestSSD) { bestSSD = ssd; bestSR = cr; bestSC = sc; }
+          }
+        }
+        for (const [sr, sc] of rndSample) {
+          const ssd = patchSSD(cr, cc, sr, sc);
+          if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = sc; }
+        }
+
+        if (bestSR >= 0) {
+          for (let dr = -halfPatch; dr <= halfPatch; dr++) {
+            for (let dc = -halfPatch; dc <= halfPatch; dc++) {
+              const tr = row + dr, tc = col + dc;
+              if (!isWm(tr, tc) || !isValid(tr, tc)) continue;
+              for (let ch = 0; ch < channels; ch++) {
+                output[px(tr, tc, ch)] = data[px(bestSR + dr, bestSC + dc, ch)];
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Bilateral filter on filled region (includes clean neighbors)
+    const bfR = 2;
+    const sSig2 = 2 * 2.0 * 2.0;
+    const rSig2 = 2 * 25 * 25;
+    for (let r = wmStartRow; r < wmEndRow; r++) {
+      for (let c = wmStartCol; c < wmEndCol; c++) {
+        const cx0 = output[px(r, c, 0)], cx1 = output[px(r, c, 1)], cx2 = output[px(r, c, 2)];
+        let wSum = 0; const val = [0, 0, 0, 0];
+        for (let dr = -bfR; dr <= bfR; dr++) {
+          for (let dc = -bfR; dc <= bfR; dc++) {
+            const nr = r + dr, nc = c + dc;
+            if (!isValid(nr, nc)) continue;
+            const buf = isWm(nr, nc) ? output : data;
+            const n0 = buf[px(nr, nc, 0)], n1 = buf[px(nr, nc, 1)], n2 = buf[px(nr, nc, 2)];
+            const w = Math.exp(-((dr*dr+dc*dc)/sSig2) - (((cx0-n0)**2+(cx1-n1)**2+(cx2-n2)**2)/rSig2));
+            val[0] += n0*w; val[1] += n1*w; val[2] += n2*w;
+            if (channels > 3) val[3] += buf[px(nr, nc, 3)] * w;
+            wSum += w;
+          }
+        }
+        for (let ch = 0; ch < channels; ch++) {
+          data[px(r, c, ch)] = clamp(val[ch] / Math.max(wSum, 1e-6));
+        }
+      }
+    }
+  }
+
+  /**
+   * 角落徽章 Laplace 调和填充
+   *
+   * 算法：
+   *   1. 从填充区域上方/左方取多行/列均值作为参考（避开 badge 过渡色）
+   *   2. 用仿射 tent 公式初始化（好的初值加速收敛）
+   *   3. Gauss-Seidel 迭代求解离散 Laplace 方程：∇²u = 0
+   *      - Dirichlet BC (上/左)：图像中 top-1 行、left-1 列（已是干净背景）
+   *      - Neumann   BC (下/右)：零法向导数（镜像反射）
+   *   → 结果是满足边界条件的最平滑填充，自然延伸背景渐变
+   */
+  private gradientFillRegion(
+    data: Buffer,
+    width: number,
+    height: number,
+    channels: number,
+    left: number,
+    top: number,
+    right: number,
+    bottom: number
+  ): void {
+    const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+    const fillH = bottom - top;
+    const fillW = right - left;
+    if (fillH <= 0 || fillW <= 0) return;
+
+    // ── Multi-row reference (far above fill, clean background) ──────────────
+    const REF_N    = 4;
+    const refRowGap = Math.max(25, Math.floor(height * 0.03));
+    const refRow0   = Math.max(0, top - refRowGap - REF_N);
+    const refRow1   = Math.max(refRow0 + 1, top - refRowGap);
+    const nRefRows  = refRow1 - refRow0;
+
+    const topRef = new Float32Array(fillW * channels);
+    for (let r = refRow0; r < refRow1 && r < height; r++) {
+      for (let ci = 0; ci < fillW; ci++) {
+        const si = (r * width + (left + ci)) * channels;
+        for (let ch = 0; ch < channels; ch++) topRef[ci * channels + ch] += data[si + ch];
+      }
+    }
+    for (let i = 0; i < topRef.length; i++) topRef[i] /= nRefRows;
+
+    // ── Multi-col reference (far to the left, clean background) ─────────────
+    const refColGap = Math.max(25, Math.floor(width * 0.03));
+    const refCol0   = Math.max(0, left - refColGap - REF_N);
+    const refCol1   = Math.max(refCol0 + 1, left - refColGap);
+    const nRefCols  = refCol1 - refCol0;
+
+    const leftRef = new Float32Array(fillH * channels);
+    for (let c = refCol0; c < refCol1 && c < width; c++) {
+      for (let ri = 0; ri < fillH; ri++) {
+        const si = ((top + ri) * width + c) * channels;
+        for (let ch = 0; ch < channels; ch++) leftRef[ri * channels + ch] += data[si + ch];
+      }
+    }
+    for (let i = 0; i < leftRef.length; i++) leftRef[i] /= nRefCols;
+
+    // Corner: mean of reference-row × reference-col overlap
+    const cornerRef = new Float32Array(channels);
+    let nCorner = 0;
+    for (let r = refRow0; r < refRow1 && r < height; r++) {
+      for (let c = refCol0; c < refCol1 && c < width; c++) {
+        const si = (r * width + c) * channels;
+        for (let ch = 0; ch < channels; ch++) cornerRef[ch] += data[si + ch];
+        nCorner++;
+      }
+    }
+    if (nCorner > 0) for (let ch = 0; ch < channels; ch++) cornerRef[ch] /= nCorner;
+
+    // ── Init: affine tent (good starting point for Laplace) ──────────────────
+    const buf = new Float32Array(fillH * fillW * channels);
+    for (let ri = 0; ri < fillH; ri++) {
+      for (let ci = 0; ci < fillW; ci++) {
+        const bi = (ri * fillW + ci) * channels;
+        for (let ch = 0; ch < channels; ch++) {
+          buf[bi + ch] = topRef[ci * channels + ch] + leftRef[ri * channels + ch] - cornerRef[ch];
+        }
+      }
+    }
+
+    // ── Gauss-Seidel + SOR Laplace solver ──────────────────────────────────────
+    // Dirichlet: row top-1 (north) and col left-1 (west) — already clean background
+    // Neumann  : bottom and right — zero-gradient (index reflection)
+    // SOR ω ≈ 1.9 drastically accelerates convergence vs plain Gauss-Seidel (ω=1),
+    // especially for pixels far from the Dirichlet boundary (e.g. the far corner).
+    const ITERS = 100;
+    const SOR_W = 1.9;
+    for (let iter = 0; iter < ITERS; iter++) {
+      for (let ri = 0; ri < fillH; ri++) {
+        const r = ri + top;
+        for (let ci = 0; ci < fillW; ci++) {
+          const c  = ci + left;
+          const bi = (ri * fillW + ci) * channels;
+          // Neumann reflection indices
+          const riS = ri < fillH - 1 ? ri + 1 : (ri > 0 ? ri - 1 : 0);
+          const ciE = ci < fillW - 1 ? ci + 1 : (ci > 0 ? ci - 1 : 0);
+
+          for (let ch = 0; ch < channels; ch++) {
+            // North: Dirichlet from image row top-1, or buf
+            const N = ri > 0
+              ? buf[((ri - 1) * fillW + ci) * channels + ch]
+              : (top > 0 ? data[((top - 1) * width + c) * channels + ch]
+                         : buf[(riS * fillW + ci) * channels + ch]);
+            // South: Neumann reflection
+            const S = buf[(riS * fillW + ci) * channels + ch];
+            // West: Dirichlet from image col left-1, or buf
+            const W = ci > 0
+              ? buf[(ri * fillW + (ci - 1)) * channels + ch]
+              : (left > 0 ? data[(r * width + (left - 1)) * channels + ch]
+                          : buf[(ri * fillW + ciE) * channels + ch]);
+            // East: Neumann reflection
+            const E = buf[(ri * fillW + ciE) * channels + ch];
+
+            const lap = (N + S + W + E) * 0.25;
+            buf[bi + ch] = buf[bi + ch] + SOR_W * (lap - buf[bi + ch]);
+          }
+        }
+      }
+    }
+
+    // ── Write back ──────────────────────────────────────────────────────────
+    for (let ri = 0; ri < fillH; ri++) {
+      for (let ci = 0; ci < fillW; ci++) {
+        const bi = (ri * fillW + ci) * channels;
+        const di = ((ri + top) * width + (ci + left)) * channels;
+        for (let ch = 0; ch < channels; ch++) {
+          data[di + ch] = clamp(buf[bi + ch]);
+        }
+      }
+    }
+  }
+
+  /**
+   * 高级 inpaint 算法核心实现（v2）
+   * 改进：BFS 边界优先填充 + 修复 patchSSD（屏蔽未填充水印像素）
+   *       + 精细步长搜索 + 随机全局采样 + 边界渐变融合 + 改进双边滤波
    */
   private advancedInpaint(
     data: Buffer,
@@ -1121,303 +1539,238 @@ export class WatermarkRemover {
   ): void {
     const wmHeight = wmEndRow - wmStartRow;
     const wmWidth = wmEndCol - wmStartCol;
-    const patchSize = 8;
-    const halfPatch = patchSize >> 1;
-
-    // 边界安全检查
     if (wmHeight <= 0 || wmWidth <= 0) return;
 
-    const px = (row: number, col: number, c: number) => (row * bytesPerRow + col * channels + c);
+    // 大面积水印区域使用 Patch 块批处理（速度优先）；小区域使用逐像素 BFS（质量优先）
+    const wmArea = wmHeight * wmWidth;
+    if (wmArea > 80000) {
+      this.batchPatchInpaint(data, width, height, channels, bytesPerRow, wmStartRow, wmEndRow, wmStartCol, wmEndCol);
+      return;
+    }
 
-    const getPixel = (row: number, col: number, c: number): number => {
-      if (row < 0 || row >= height || col < 0 || col >= width) return 128;
-      return data[px(row, col, c)];
-    };
-
-    const clamp = (v: number) => Math.max(0, Math.min(255, v));
-
-    /** 判断像素是否在水印区域内 */
-    const isInWm = (r: number, c: number) =>
+    const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+    const px = (r: number, c: number, ch: number) => r * bytesPerRow + c * channels + ch;
+    const isValid = (r: number, c: number) => r >= 0 && r < height && c >= 0 && c < width;
+    const isWm = (r: number, c: number) =>
       r >= wmStartRow && r < wmEndRow && c >= wmStartCol && c < wmEndCol;
+    const wmIdx = (r: number, c: number) => (r - wmStartRow) * wmWidth + (c - wmStartCol);
 
-    /** 判断像素是否在非水印源区域（可用于采样） */
-    const isSource = (r: number, c: number) =>
-      r >= 0 && r < height && c >= 0 && c < width && !isInWm(r, c);
+    // 工作副本 — BFS 阶段填充后的像素写入此处
+    const output = Buffer.from(data);
+    // 布尔标记：此水印像素是否已被填充（修复 value>0 误判黑色像素的 bug）
+    const isFilled = new Uint8Array(wmHeight * wmWidth);
 
+    const patchSize = 7;
+    const halfPatch = Math.floor(patchSize / 2);
+
+    // --- patchSSD（修复核心 bug）---
+    // 仅比较"双方都合法"的像素对：
+    //   查询侧 (ar, ac): 干净像素 OR 已填充水印像素
+    //   来源侧 (br, bc): 必须是干净像素（不在水印区）
     const patchSSD = (r1: number, c1: number, r2: number, c2: number): number => {
-      let sum = 0;
-      let count = 0;
+      let sum = 0, count = 0;
       for (let dr = -halfPatch; dr <= halfPatch; dr++) {
         for (let dc = -halfPatch; dc <= halfPatch; dc++) {
           const ar = r1 + dr, ac = c1 + dc;
           const br = r2 + dr, bc = c2 + dc;
-          // 只比较双方都有效的像素（至少一方在图内）
-          if (ar >= 0 && ar < height && ac >= 0 && ac < width &&
-              br >= 0 && br < height && bc >= 0 && bc < width) {
-            for (let ch = 0; ch < 3; ch++) {
-              const diff = getPixel(ar, ac, ch) - getPixel(br, bc, ch);
-              sum += diff * diff;
-            }
-            count++;
+          if (!isValid(ar, ac) || !isValid(br, bc)) continue;
+          if (isWm(br, bc)) continue;
+          if (isWm(ar, ac) && !isFilled[wmIdx(ar, ac)]) continue;
+          const a0 = isWm(ar, ac) ? output[px(ar, ac, 0)] : data[px(ar, ac, 0)];
+          const a1 = isWm(ar, ac) ? output[px(ar, ac, 1)] : data[px(ar, ac, 1)];
+          const a2 = isWm(ar, ac) ? output[px(ar, ac, 2)] : data[px(ar, ac, 2)];
+          const d0 = a0 - data[px(br, bc, 0)];
+          const d1 = a1 - data[px(br, bc, 1)];
+          const d2 = a2 - data[px(br, bc, 2)];
+          sum += d0 * d0 + d1 * d1 + d2 * d2;
+          count++;
+        }
+      }
+      return count >= halfPatch ? sum / count : Infinity;
+    };
+
+    // --- BFS 填充顺序：从边界向内（边界优先，防止错误传播）---
+    const fillOrder: [number, number][] = [];
+    const visited = new Uint8Array(wmHeight * wmWidth);
+    const bfsQueue: [number, number][] = [];
+    const dirs4: [number, number][] = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+
+    for (let r = wmStartRow; r < wmEndRow; r++) {
+      for (let c = wmStartCol; c < wmEndCol; c++) {
+        const wi = wmIdx(r, c);
+        if (visited[wi]) continue;
+        for (const [dr, dc] of dirs4) {
+          const nr = r + dr, nc = c + dc;
+          if (isValid(nr, nc) && !isWm(nr, nc)) {
+            visited[wi] = 1;
+            bfsQueue.push([r, c]);
+            break;
           }
         }
       }
-      return count > 0 ? sum / count : Infinity;
-    };
-
-    // Phase 1: Patch 匹配填充 — 对水印区域的每个 patch，在非水印区域搜索最相似 patch
-    const filled = new Float32Array(wmHeight * wmWidth * channels);
-
-    // 确定搜索区域：优先从相邻的非水印区域搜索
-    const searchAboveRows = wmStartRow;
-    const searchBelowRows = height - wmEndRow;
-    const searchLeftCols = wmStartCol;
-    const searchRightCols = width - wmEndCol;
-
-    for (let row = wmStartRow; row < wmEndRow; row += patchSize) {
-      for (let col = wmStartCol; col < wmEndCol; col += patchSize) {
-        const centerR = Math.min(row + halfPatch, wmEndRow - 1);
-        const centerC = Math.min(col + halfPatch, wmEndCol - 1);
-
-        let bestSSD = Infinity;
-        let bestSR = centerR;
-        let bestSC = centerC;
-
-        // 搜索步长：根据图片大小自适应
-        const step = Math.max(1, Math.floor(Math.max(searchAboveRows, searchBelowRows, 100) / 40));
-
-        // 向上搜索（最优先）
-        if (searchAboveRows > halfPatch) {
-          const searchEnd = Math.max(halfPatch, wmStartRow - searchAboveRows);
-          for (let sr = wmStartRow - 1; sr >= searchEnd; sr -= step) {
-            const ssd = patchSSD(centerR, centerC, sr, centerC);
-            if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = centerC; }
-          }
+    }
+    let head = 0;
+    while (head < bfsQueue.length) {
+      const [r, c] = bfsQueue[head++];
+      fillOrder.push([r, c]);
+      for (const [dr, dc] of dirs4) {
+        const nr = r + dr, nc = c + dc;
+        if (isWm(nr, nc)) {
+          const wi = wmIdx(nr, nc);
+          if (!visited[wi]) { visited[wi] = 1; bfsQueue.push([nr, nc]); }
         }
+      }
+    }
 
-        // 向下搜索
-        if (searchBelowRows > halfPatch) {
-          const searchStart = Math.min(height - halfPatch - 1, wmEndRow + searchBelowRows);
-          for (let sr = wmEndRow; sr <= searchStart; sr += step) {
-            const ssd = patchSSD(centerR, centerC, sr, centerC);
-            if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = centerC; }
-          }
+    // --- 全局随机采样候选源像素 ---
+    const sStep = Math.max(3, Math.floor(Math.sqrt(width * height) / 15));
+    const srcPool: [number, number][] = [];
+    for (let r = halfPatch; r < height - halfPatch; r += sStep) {
+      for (let c = halfPatch; c < width - halfPatch; c += sStep) {
+        if (!isWm(r, c)) srcPool.push([r, c]);
+      }
+    }
+    for (let i = srcPool.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      [srcPool[i], srcPool[j]] = [srcPool[j], srcPool[i]];
+    }
+    const rndSample = srcPool.slice(0, 300);
+
+    const sweepStep = Math.max(2, halfPatch);
+    const sweepRange = Math.min(Math.max(wmHeight, wmWidth) * 2 + 50, 200);
+
+    // --- 按 BFS 顺序逐像素填充 ---
+    for (const [r, c] of fillOrder) {
+      let bestSSD = Infinity, bestSR = -1, bestSC = -1;
+
+      // 四方向扫描：从水印各边界向外搜索
+      if (wmStartRow > halfPatch) {
+        const from = Math.max(halfPatch, wmStartRow - sweepRange);
+        const fc = Math.min(Math.max(c, halfPatch), width - halfPatch - 1);
+        for (let sr = wmStartRow - 1; sr >= from; sr -= sweepStep) {
+          const ssd = patchSSD(r, c, sr, fc);
+          if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = fc; }
         }
-
-        // 向左搜索
-        if (searchLeftCols > halfPatch) {
-          const searchEnd = Math.max(halfPatch, wmStartCol - searchLeftCols);
-          for (let sc = wmStartCol - 1; sc >= searchEnd; sc -= step) {
-            const ssd = patchSSD(centerR, centerC, centerR, sc);
-            if (ssd < bestSSD) { bestSSD = ssd; bestSR = centerR; bestSC = sc; }
-          }
+      }
+      if (wmEndRow < height - halfPatch) {
+        const to = Math.min(height - halfPatch - 1, wmEndRow + sweepRange);
+        const fc = Math.min(Math.max(c, halfPatch), width - halfPatch - 1);
+        for (let sr = wmEndRow; sr <= to; sr += sweepStep) {
+          const ssd = patchSSD(r, c, sr, fc);
+          if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = fc; }
         }
-
-        // 向右搜索
-        if (searchRightCols > halfPatch) {
-          const searchStart = Math.min(width - halfPatch - 1, wmEndCol + searchRightCols);
-          for (let sc = wmEndCol; sc <= searchStart; sc += step) {
-            const ssd = patchSSD(centerR, centerC, centerR, sc);
-            if (ssd < bestSSD) { bestSSD = ssd; bestSR = centerR; bestSC = sc; }
-          }
+      }
+      if (wmStartCol > halfPatch) {
+        const from = Math.max(halfPatch, wmStartCol - sweepRange);
+        const fr = Math.min(Math.max(r, halfPatch), height - halfPatch - 1);
+        for (let sc = wmStartCol - 1; sc >= from; sc -= sweepStep) {
+          const ssd = patchSSD(r, c, fr, sc);
+          if (ssd < bestSSD) { bestSSD = ssd; bestSR = fr; bestSC = sc; }
         }
+      }
+      if (wmEndCol < width - halfPatch) {
+        const to = Math.min(width - halfPatch - 1, wmEndCol + sweepRange);
+        const fr = Math.min(Math.max(r, halfPatch), height - halfPatch - 1);
+        for (let sc = wmEndCol; sc <= to; sc += sweepStep) {
+          const ssd = patchSSD(r, c, fr, sc);
+          if (ssd < bestSSD) { bestSSD = ssd; bestSR = fr; bestSC = sc; }
+        }
+      }
 
-        // 局部精细搜索
-        const localR1 = Math.max(0, bestSR - patchSize * 2);
-        const localR2 = Math.min(height - 1, bestSR + patchSize * 2);
-        const localC1 = Math.max(0, bestSC - patchSize * 2);
-        const localC2 = Math.min(width - 1, bestSC + patchSize * 2);
-        for (let sr = localR1; sr <= localR2; sr += Math.max(1, Math.floor(step / 2))) {
-          for (let sc = localC1; sc <= localC2; sc += Math.max(1, Math.floor(step / 2))) {
-            if (!isSource(sr, sc)) continue;
-            const ssd = patchSSD(centerR, centerC, sr, sc);
+      // 全局随机采样
+      for (const [sr, sc] of rndSample) {
+        const ssd = patchSSD(r, c, sr, sc);
+        if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = sc; }
+      }
+
+      // 最优候选局部精细搜索
+      if (bestSR >= 0) {
+        const lr1 = Math.max(halfPatch, bestSR - patchSize);
+        const lr2 = Math.min(height - halfPatch - 1, bestSR + patchSize);
+        const lc1 = Math.max(halfPatch, bestSC - patchSize);
+        const lc2 = Math.min(width - halfPatch - 1, bestSC + patchSize);
+        for (let sr = lr1; sr <= lr2; sr++) {
+          for (let sc = lc1; sc <= lc2; sc++) {
+            if (isWm(sr, sc)) continue;
+            const ssd = patchSSD(r, c, sr, sc);
             if (ssd < bestSSD) { bestSSD = ssd; bestSR = sr; bestSC = sc; }
           }
         }
+      }
 
-        // 填充结果到 filled buffer
-        for (let dr = -halfPatch; dr <= halfPatch; dr++) {
-          for (let dc = -halfPatch; dc <= halfPatch; dc++) {
-            const tr = row + dr;
-            const tc = col + dc;
-            if (isInWm(tr, tc)) {
-              const fi = (tr - wmStartRow) * wmWidth * channels + (tc - wmStartCol) * channels;
-              for (let ch = 0; ch < channels; ch++) {
-                filled[fi + ch] = getPixel(bestSR + dr, bestSC + dc, ch);
-              }
-            }
-          }
+      if (bestSR >= 0) {
+        for (let ch = 0; ch < channels; ch++) output[px(r, c, ch)] = data[px(bestSR, bestSC, ch)];
+      } else {
+        // 兜底：已填充/干净邻居的均值
+        const vSum = [0, 0, 0, 0]; let cnt = 0;
+        const dirs8: [number, number][] = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
+        for (const [dr, dc] of dirs8) {
+          const nr = r + dr, nc = c + dc;
+          if (!isValid(nr, nc)) continue;
+          if (isWm(nr, nc) && !isFilled[wmIdx(nr, nc)]) continue;
+          for (let ch = 0; ch < channels; ch++) vSum[ch] += output[px(nr, nc, ch)];
+          cnt++;
+        }
+        if (cnt > 0) {
+          for (let ch = 0; ch < channels; ch++) output[px(r, c, ch)] = clamp(vSum[ch] / cnt);
         }
       }
+      isFilled[wmIdx(r, c)] = 1;
     }
 
-    // 填补未覆盖的像素（用最近邻）
+    // --- 边界渐变融合：消除填充区与原图的硬接缝 ---
+    const blendR = 4;
+    const blended = Buffer.from(output);
     for (let r = wmStartRow; r < wmEndRow; r++) {
       for (let c = wmStartCol; c < wmEndCol; c++) {
-        const fi = (r - wmStartRow) * wmWidth * channels + (c - wmStartCol) * channels;
-        let hasFilled = false;
-        for (let ch = 0; ch < channels; ch++) {
-          if (filled[fi + ch] > 0) { hasFilled = true; break; }
-        }
-        if (!hasFilled) {
-          // 从四个方向找最近的非水印像素
-          const candidates: [number, number][] = [];
-          if (isSource(r - 1, c)) candidates.push([r - 1, c]);
-          if (isSource(r + 1, c)) candidates.push([r + 1, c]);
-          if (isSource(r, c - 1)) candidates.push([r, c - 1]);
-          if (isSource(r, c + 1)) candidates.push([r, c + 1]);
-          if (candidates.length > 0) {
-            const [refR, refC] = candidates[0];
-            for (let ch = 0; ch < channels; ch++) {
-              filled[fi + ch] = data[px(refR, refC, ch)];
-            }
-          } else {
-            for (let ch = 0; ch < channels; ch++) {
-              filled[fi + ch] = 128;
-            }
-          }
-        }
-      }
-    }
-
-    // Phase 2: 多方向纹理传播 — 从所有非水印边界向中心加权融合
-    const propagated = new Float32Array(wmHeight * wmWidth * channels);
-
-    for (let r = wmStartRow; r < wmEndRow; r++) {
-      for (let c = wmStartCol; c < wmEndCol; c++) {
-        const pi = (r - wmStartRow) * wmWidth * channels + (c - wmStartCol) * channels;
-        let wSum = 0;
-        const val = [0, 0, 0, 0];
-
-        // 从上方边界传播
-        if (wmStartRow > 0) {
-          const dist = (r - wmStartRow + 1);
-          const w = 1.0 / (dist * dist + 1);
-          const srcR = wmStartRow - 1;
-          for (let ch = 0; ch < channels; ch++) val[ch] += data[px(srcR, c, ch)] * w;
-          wSum += w;
-        }
-        // 从下方边界传播
-        if (wmEndRow < height) {
-          const dist = (wmEndRow - r);
-          const w = 1.0 / (dist * dist + 1);
-          const srcR = wmEndRow;
-          for (let ch = 0; ch < channels; ch++) val[ch] += data[px(srcR, c, ch)] * w;
-          wSum += w;
-        }
-        // 从左边界传播
-        if (c > wmStartCol) {
-          const margin = c - wmStartCol;
-          const w = 0.5 / (margin * margin + 1);
-          const srcC = wmStartCol - 1;
-          if (srcC >= 0) {
-            for (let ch = 0; ch < channels; ch++) val[ch] += data[px(r, srcC, ch)] * w;
-            wSum += w;
-          }
-        }
-        // 从右边界传播
-        if (c < wmEndCol - 1) {
-          const margin = wmEndCol - 1 - c;
-          const w = 0.5 / (margin * margin + 1);
-          const srcC = wmEndCol;
-          if (srcC < width) {
-            for (let ch = 0; ch < channels; ch++) val[ch] += data[px(r, srcC, ch)] * w;
-            wSum += w;
-          }
-        }
-
-        // 融合 Patch 匹配结果
-        const patchVal = [filled[pi], filled[pi + 1], filled[pi + 2], channels > 3 ? filled[pi + 3] : 0];
-        const patchW = 1.5;
-        for (let ch = 0; ch < channels; ch++) val[ch] += patchVal[ch] * patchW;
-        wSum += patchW;
-
-        for (let ch = 0; ch < channels; ch++) {
-          propagated[pi + ch] = val[ch] / Math.max(wSum, 0.001);
-        }
-      }
-    }
-
-    // Phase 3: 边缘感知细化 — 检测边缘并沿边缘方向平滑
-    const edgeRadius = 2;
-    for (let r = wmStartRow; r < wmEndRow; r++) {
-      for (let c = wmStartCol + edgeRadius; c < wmEndCol - edgeRadius; c++) {
-        const pi = (r - wmStartRow) * wmWidth * channels + (c - wmStartCol) * channels;
-
-        let leftGrad = 0, rightGrad = 0;
-        for (let ch = 0; ch < 3; ch++) {
-          const li = (r - wmStartRow) * wmWidth * channels + (c - edgeRadius - wmStartCol) * channels;
-          const ri = (r - wmStartRow) * wmWidth * channels + (c + edgeRadius - wmStartCol) * channels;
-          leftGrad += Math.abs(propagated[pi + ch] - propagated[li + ch]);
-          rightGrad += Math.abs(propagated[pi + ch] - propagated[ri + ch]);
-        }
-
-        if (leftGrad + rightGrad > 30) {
-          const edgeW = 0.3;
-          const neighborAvg = (cSide: number) => {
-            let sum = [0, 0, 0, 0];
-            for (let dc = -1; dc <= 1; dc++) {
-              const ni = (r - wmStartRow) * wmWidth * channels + (c + cSide + dc - wmStartCol) * channels;
-              for (let ch = 0; ch < channels; ch++) sum[ch] += propagated[ni + ch];
-            }
-            return sum.map(v => v / 3);
-          };
-          const lAvg = leftGrad > rightGrad ? neighborAvg(-1) : neighborAvg(1);
-          for (let ch = 0; ch < channels; ch++) {
-            propagated[pi + ch] = propagated[pi + ch] * (1 - edgeW) + lAvg[ch] * edgeW;
-          }
-        }
-      }
-    }
-
-    // Phase 4: 双边滤波后处理 — 平滑噪声同时保持边缘
-    const spatialSigma = 2.0;
-    const rangeSigma = 25.0;
-    const radius = 2;
-    const output = new Uint8Array(wmHeight * wmWidth * channels);
-
-    for (let r = wmStartRow; r < wmEndRow; r++) {
-      for (let c = wmStartCol; c < wmEndCol; c++) {
-        const pi = (r - wmStartRow) * wmWidth * channels + (c - wmStartCol) * channels;
-        let wSum = 0;
-        const val = [0.0, 0.0, 0.0, 0.0];
-        const center = [propagated[pi], propagated[pi + 1], propagated[pi + 2], channels > 3 ? propagated[pi + 3] : 0];
-
-        for (let dr = -radius; dr <= radius; dr++) {
-          for (let dc = -radius; dc <= radius; dc++) {
+        const distEdge = Math.min(
+          r - wmStartRow, wmEndRow - 1 - r,
+          c - wmStartCol, wmEndCol - 1 - c
+        );
+        if (distEdge >= blendR) continue;
+        const alpha = distEdge / blendR;
+        let cSum = [0, 0, 0, 0]; let cCnt = 0;
+        for (let dr = -blendR; dr <= blendR; dr++) {
+          for (let dc = -blendR; dc <= blendR; dc++) {
             const nr = r + dr, nc = c + dc;
-            if (!isInWm(nr, nc)) continue;
-
-            const ni = (nr - wmStartRow) * wmWidth * channels + (nc - wmStartCol) * channels;
-            const neighbor = [propagated[ni], propagated[ni + 1], propagated[ni + 2], channels > 3 ? propagated[ni + 3] : 0];
-
-            const spatialDist = Math.sqrt(dr * dr + dc * dc);
-            const spatialW = Math.exp(-(spatialDist * spatialDist) / (2 * spatialSigma * spatialSigma));
-
-            let rangeDist = 0;
-            for (let ch = 0; ch < 3; ch++) rangeDist += (center[ch] - neighbor[ch]) ** 2;
-            const rangeW = Math.exp(-rangeDist / (2 * rangeSigma * rangeSigma));
-
-            const w = spatialW * rangeW;
-            for (let ch = 0; ch < channels; ch++) val[ch] += neighbor[ch] * w;
-            wSum += w;
+            if (!isValid(nr, nc) || isWm(nr, nc)) continue;
+            for (let ch = 0; ch < channels; ch++) cSum[ch] += data[px(nr, nc, ch)];
+            cCnt++;
           }
         }
-
         for (let ch = 0; ch < channels; ch++) {
-          output[pi + ch] = clamp(Math.round(val[ch] / Math.max(wSum, 0.001)));
+          const f = output[px(r, c, ch)];
+          const cl = cCnt > 0 ? cSum[ch] / cCnt : f;
+          blended[px(r, c, ch)] = clamp(f * alpha + cl * (1 - alpha));
         }
       }
     }
 
-    // 写回原始数据
-    const wmRowBytes = wmWidth * channels;
-    const wmColOffset = wmStartCol * channels;
+    // --- 双边滤波（包含干净邻居，消除接缝噪声）---
+    const bfR = 3;
+    const sSig2 = 2 * 2.5 * 2.5;
+    const rSig2 = 2 * 30 * 30;
     for (let r = wmStartRow; r < wmEndRow; r++) {
-      const rowStart = r * bytesPerRow;
-      const oi = (r - wmStartRow) * wmRowBytes;
-      for (let x = 0; x < wmRowBytes; x++) {
-        data[rowStart + wmColOffset + x] = output[oi + x];
+      for (let c = wmStartCol; c < wmEndCol; c++) {
+        const cx0 = blended[px(r, c, 0)], cx1 = blended[px(r, c, 1)], cx2 = blended[px(r, c, 2)];
+        let wSum = 0; const val = [0, 0, 0, 0];
+        for (let dr = -bfR; dr <= bfR; dr++) {
+          for (let dc = -bfR; dc <= bfR; dc++) {
+            const nr = r + dr, nc = c + dc;
+            if (!isValid(nr, nc)) continue;
+            const buf = isWm(nr, nc) ? blended : data;
+            const n0 = buf[px(nr, nc, 0)], n1 = buf[px(nr, nc, 1)], n2 = buf[px(nr, nc, 2)];
+            const sDist = dr * dr + dc * dc;
+            const rDist = (cx0 - n0) ** 2 + (cx1 - n1) ** 2 + (cx2 - n2) ** 2;
+            const w = Math.exp(-sDist / sSig2 - rDist / rSig2);
+            val[0] += n0 * w; val[1] += n1 * w; val[2] += n2 * w;
+            if (channels > 3) val[3] += buf[px(nr, nc, 3)] * w;
+            wSum += w;
+          }
+        }
+        for (let ch = 0; ch < channels; ch++) {
+          data[px(r, c, ch)] = clamp(val[ch] / Math.max(wSum, 1e-6));
+        }
       }
     }
   }
